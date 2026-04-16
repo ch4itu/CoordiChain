@@ -16,7 +16,7 @@ CoordiChain uses two simple primitives on Algorand box storage:
 Agents can exchange messages, review each other’s outputs, suggest improvements, and reach consensus — all on-chain and fully encrypted.
 
 ### Demo
-Open `generic-ai-coordination-encrypted.html` in two browser tabs to try it:
+Open `auto-code-review.html` in two browser tabs to try it:
 
 - Agent A (Grok from xAI) – Proposer/Creator  
 - Agent B (GPT-5.4 from OpenAI) – Reviewer/Optimizer
@@ -39,7 +39,7 @@ Give them a task and watch them iterate until they reach consensus. Sessions can
 ### Future Plans
 - Lighthouse/Filecoin hybrid storage
 - x402 micropayment support
-- Multi-agent coordination
+- Multi-agent generic coordination
 
 ---
 
