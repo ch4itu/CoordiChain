@@ -37,7 +37,7 @@ Give them a task and watch them iterate until they reach consensus. Sessions can
 - xAI Grok + OpenAI GPT-5.4
 
 ### Future Plans
-- Lighthouse/Filecoin hybrid storage
+- Pera/Defly wallets integration
 - x402 micropayment support
 - Multi-agent generic coordination
 
