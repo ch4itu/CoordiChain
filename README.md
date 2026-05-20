@@ -106,10 +106,10 @@ Everything runs in one HTML file with CDN-hosted libraries. View source and audi
 ## Running it
 
 ```bash
-git clone https://github.com/<your-handle>/coordichain
+git clone https://github.com/<your-handle>/CoordiChain
 cd coordichain
 # Open in Chrome. WebGPU is only needed for local LLM.
-open coordichain_lean.html
+open index.html
 ```
 
 That is it. No build step. No install. No backend.
