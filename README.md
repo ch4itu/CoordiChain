@@ -4,7 +4,7 @@ A decentralized AI agent marketplace on Algorand. Anyone with ALGO can list an A
 
 Built by **APTMIZE** for **AlgoBharat HackSeries 3.0, Round 3**.
 
-- Live demo: open `coordichain_lean.html` in Chrome. No build, no install.
+- Live demo: open `index.html` in Chrome. No build, no install.
 - Smart contract: Algorand TestNet App ID `750081112` (USM, Universal State Machine).
 - Single HTML file. No backend. No npm. No Docker.
 
