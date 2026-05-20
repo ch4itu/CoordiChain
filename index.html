@@ -1,0 +1,4154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CoordiChain - Single File Robust Auto-Discovery</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/algosdk@2.7.0/dist/browser/algosdk.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl-fast.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tweetnacl-util@0.15.1/nacl-util.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/ed2curve@0.3.0/ed2curve.min.js"></script>
+
+  <script>
+// App ID 750081112 (TestNet)
+// Uses proper ABI contract with AtomicTransactionComposer
+
+const ALGOD_SERVER = "https://testnet-api.algonode.cloud";
+const INDEXER_SERVER = "https://testnet-idx.algonode.cloud";
+
+const algodClient = new algosdk.Algodv2("", ALGOD_SERVER, "");
+const indexerClient = new algosdk.Indexer("", INDEXER_SERVER, "");
+
+const APP_ID = 750081112;
+
+// Embedded ABI contract definition (matches UniversalStateMachine)
+const CONTRACT_ABI = {
+  name: "UniversalStateMachine",
+  methods: [
+    {
+      name: "save_entity",
+      args: [
+        { type: "string", name: "entity_id" },
+        { type: "string", name: "entity_data" }
+      ],
+      returns: { type: "string" }
+    },
+    {
+      name: "load_entity",
+      args: [
+        { type: "string", name: "entity_id" }
+      ],
+      returns: { type: "string" }
+    },
+    {
+      name: "start_process",
+      args: [
+        { type: "string", name: "process_id" },
+        { type: "address", name: "other_party" },
+        { type: "string", name: "initial_state" },
+        { type: "uint64", name: "timeout_rounds" }
+      ],
+      returns: { type: "string" }
+    },
+    {
+      name: "update_process",
+      args: [
+        { type: "string", name: "process_id" },
+        { type: "string", name: "new_state" }
+      ],
+      returns: { type: "string" }
+    },
+    {
+      name: "load_process",
+      args: [
+        { type: "string", name: "process_id" }
+      ],
+      returns: { type: "string" }
+    },
+    {
+      name: "resign_process",
+      args: [
+        { type: "string", name: "process_id" }
+      ],
+      returns: { type: "void" }
+    },
+    {
+      name: "get_process_info",
+      args: [
+        { type: "string", name: "process_id" }
+      ],
+      returns: { type: "(address,address,uint64,bool,uint64)" }
+    },
+    {
+      name: "delete_entity",
+      args: [
+        { type: "string", name: "entity_id" }
+      ],
+      returns: { type: "void" }
+    },
+    {
+      name: "delete_process",
+      args: [
+        { type: "string", name: "process_id" }
+      ],
+      returns: { type: "void" }
+    }
+  ]
+};
+
+let abiContract = null;
+
+// Initialize ABI contract
+function initContractABI() {
+  try {
+    abiContract = new algosdk.ABIContract(CONTRACT_ABI);
+    console.log('✅ Contract ABI initialized');
+  } catch (error) {
+    console.error('Failed to initialize contract ABI:', error);
+    throw error;
+  }
+}
+
+// Safe logging function
+function contractLog(msg) {
+  if (typeof window.logToUI === 'function') {
+    window.logToUI(msg);
+  }
+  console.log("[Contract]", msg);
+}
+
+// Calculate MBR for box storage
+function calculateMBR(stateDataSize, isProcess = false, keyLength = null) {
+  // CRITICAL: Match contract's EXACT MBR formula!
+  // Contract formula: 2500 + 400 * total_bytes
+  //
+  // Contract uses .native.bytes which strips ARC4 encoding!
+  // Box storage structure:
+  // - Entity: key="e:"+id, value=owner(32)+raw_data
+  // - Process: key="p:"+id, value=p1(32)+p2(32)+turn(8)+finalFlag(1)+timeoutRound(8)+raw_state
+  // Data is stored as raw UTF-8 bytes in boxes (NO ARC4 encoding)
+
+  if (isProcess) {
+    // Process value: 81 bytes header + raw state bytes
+    const keySize = keyLength || (2 + 16); // "p:" + process_id
+    const valueSize = 81 + stateDataSize; // Header + raw state
+    const total_bytes = keySize + valueSize;
+    return 2500 + (400 * total_bytes);
+  } else {
+    // Entity value: 32 bytes owner + raw data bytes
+    const keySize = keyLength || (2 + 58); // "e:" + entity_id
+    const valueSize = 32 + stateDataSize; // Owner + raw data
+    const total_bytes = keySize + valueSize;
+    return 2500 + (400 * total_bytes);
+  }
+}
+
+// Helper to clone suggested params
+function cloneSuggestedParams(params) {
+  return {
+    ...params,
+    genesisHash: params.genesisHash,
+    genesisID: params.genesisID,
+    consensusVersion: params.consensusVersion,
+    firstRound: params.firstRound,
+    lastRound: params.lastRound,
+    fee: params.fee,
+    minFee: params.minFee,
+    flatFee: params.flatFee
+  };
+}
+
+// Helper to get application address (compute manually for browser compatibility)
+function getApplicationAddress(appId) {
+  console.log(`[getApplicationAddress] Input appId: ${appId}, type: ${typeof appId}`);
+
+  // Check if algosdk has the function
+  if (typeof algosdk.getApplicationAddress === 'function') {
+    try {
+      const addr = algosdk.getApplicationAddress(appId);
+      console.log(`[getApplicationAddress] Using algosdk.getApplicationAddress: ${addr}`);
+      return addr;
+    } catch (e) {
+      console.warn(`[getApplicationAddress] algosdk.getApplicationAddress failed:`, e);
+    }
+  } else {
+    console.log(`[getApplicationAddress] algosdk.getApplicationAddress not available, using manual computation`);
+  }
+
+  // Manual computation for browser compatibility
+  // Application address = SHA512_256("appID" + app_id_as_uint64)
+  const APP_ID_PREFIX = new Uint8Array([97, 112, 112, 73, 68]); // "appID" in bytes
+
+  // Convert app ID to 8-byte big-endian (use local copy to avoid modifying parameter)
+  let tempId = appId;
+  const appIdBytes = new Uint8Array(8);
+  for (let i = 7; i >= 0; i--) {
+    appIdBytes[i] = tempId & 0xff;
+    tempId = Math.floor(tempId / 256);
+  }
+
+  console.log(`[getApplicationAddress] App ID bytes:`, Array.from(appIdBytes));
+
+  // Concatenate prefix + app ID bytes
+  const toHash = new Uint8Array(APP_ID_PREFIX.length + appIdBytes.length);
+  toHash.set(APP_ID_PREFIX);
+  toHash.set(appIdBytes, APP_ID_PREFIX.length);
+
+  console.log(`[getApplicationAddress] To hash:`, Array.from(toHash));
+
+  // Check what's available in algosdk
+  console.log(`[getApplicationAddress] algosdk.encodeAddress available:`, typeof algosdk.encodeAddress);
+  console.log(`[getApplicationAddress] algosdk.nacl available:`, typeof algosdk.nacl);
+  console.log(`[getApplicationAddress] algosdk.nacl?.hash available:`, typeof algosdk.nacl?.hash);
+
+  // Use algosdk's internal functions if available
+  if (algosdk.encodeAddress && algosdk.nacl && algosdk.nacl.hash) {
+    const hash = algosdk.nacl.hash(toHash).slice(0, 32);
+    console.log(`[getApplicationAddress] Hash:`, Array.from(hash));
+    const addr = algosdk.encodeAddress(hash);
+    console.log(`[getApplicationAddress] Manual computation result: ${addr}`);
+    return addr;
+  }
+
+  throw new Error("Cannot compute application address - algosdk missing required functions");
+}
+
+// Create MBR payment transaction
+function createMBRPaymentTransaction(sender, appId, amount, suggestedParams) {
+  console.log(`[createMBRPaymentTransaction] Called with sender: ${sender}, appId: ${appId}, amount: ${amount}`);
+
+  const params = cloneSuggestedParams(suggestedParams);
+  params.flatFee = true;
+  params.fee = algosdk.ALGORAND_MIN_TX_FEE;
+
+  const appAddress = getApplicationAddress(appId);
+
+  console.log(`[createMBRPaymentTransaction] Got app address: ${appAddress}`);
+  console.log(`[createMBRPaymentTransaction] sender type: ${typeof sender}, value: ${sender}`);
+  console.log(`[createMBRPaymentTransaction] appAddress type: ${typeof appAddress}, value: ${appAddress}`);
+
+  // Validate addresses before creating transaction
+  if (!sender || typeof sender !== 'string' || sender.length !== 58) {
+    throw new Error(`Invalid sender address: ${sender}`);
+  }
+
+  if (!appAddress || typeof appAddress !== 'string' || appAddress.length !== 58) {
+    throw new Error(`Invalid app address: ${appAddress}`);
+  }
+
+  return algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+    from: sender,
+    to: appAddress,
+    amount,
+    suggestedParams: params
+  });
+}
+
+// Create transaction with signer
+function createTransactionWithSigner(txn, account) {
+  return {
+    txn,
+    signer: algosdk.makeBasicAccountTransactionSigner(account)
+  };
+}
+
+// Helper function to create box keys matching contract's format
+function createEntityBoxKey(entityId) {
+  // Contract uses: b"e:" + entity_id.native.bytes
+  // .native.bytes strips ARC4 encoding, so we use raw UTF-8 bytes
+  const prefix = new TextEncoder().encode('e:');
+  const idBytes = new TextEncoder().encode(entityId);
+
+  const boxKey = new Uint8Array(prefix.length + idBytes.length);
+  boxKey.set(prefix, 0);
+  boxKey.set(idBytes, prefix.length);
+
+  return boxKey;
+}
+
+function createProcessBoxKey(processId) {
+  // Contract uses: b"p:" + process_id.native.bytes
+  // .native.bytes strips ARC4 encoding, so we use raw UTF-8 bytes
+  const prefix = new TextEncoder().encode('p:');
+  const idBytes = new TextEncoder().encode(processId);
+
+  const boxKey = new Uint8Array(prefix.length + idBytes.length);
+  boxKey.set(prefix, 0);
+  boxKey.set(idBytes, prefix.length);
+
+  return boxKey;
+}
+
+// Get signer from mnemonic
+async function getSigner() {
+  const mnemonicInput =
+    window._activeMnemonic ||                                          // marketplace explicit
+    document.getElementById("mktMnemonic")?.value.trim() ||            // marketplace provide tab
+    document.getElementById("mktJobsMnemonic")?.value.trim() ||        // marketplace jobs tab
+    document.getElementById("mnemonic")?.value.trim() ||
+    document.getElementById("coderMnemonic")?.value.trim() ||
+    document.getElementById("reviewerMnemonic")?.value.trim() ||
+    localStorage.getItem("mnemonic");
+
+  if (!mnemonicInput || mnemonicInput.split(" ").length !== 25) {
+    throw new Error("Please enter a valid 25-word TestNet mnemonic");
+  }
+
+  const mnemonic = mnemonicInput.trim();
+  localStorage.setItem("mnemonic", mnemonic);
+
+  try {
+    const account = algosdk.mnemonicToSecretKey(mnemonic);
+
+    if (!account || !account.sk) {
+      throw new Error("Failed to derive account from mnemonic");
+    }
+
+    // Handle address format
+    let addressString = account.addr;
+
+    if (typeof addressString !== 'string') {
+      if (addressString && addressString.toString) {
+        addressString = addressString.toString();
+      } else {
+        addressString = String(addressString);
+      }
+    }
+
+    // Reconstruct from secret key if needed
+    if (!addressString || addressString.length !== 58 || addressString === '[object Object]') {
+      console.log("Reconstructing address from secret key...");
+      const publicKey = new Uint8Array(account.sk.slice(32, 64));
+      addressString = algosdk.encodeAddress(publicKey);
+    }
+
+    // Validate
+    if (!addressString || addressString.length !== 58) {
+      throw new Error(`Invalid address length: ${addressString ? addressString.length : 0}`);
+    }
+
+    if (!/^[A-Z2-7]+$/.test(addressString)) {
+      throw new Error(`Address contains invalid characters`);
+    }
+
+    // Store globals
+    window.sender = addressString;
+    window.sk = account.sk;
+    window.account = account;
+
+    contractLog(`Connected: ${addressString.substring(0, 12)}...${addressString.substring(50)}`);
+
+    // Initialize ABI contract if not done
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    return account;
+
+  } catch (error) {
+    console.error("getSigner error:", error);
+    if (error.message.includes("mnemonic")) {
+      throw new Error("Invalid mnemonic. Please check your 25-word phrase.");
+    }
+    throw error;
+  }
+}
+
+// Helper to generate short hash from string
+function shortHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return Math.abs(hash).toString(36);
+}
+
+// Create Entity using ABI contract
+async function createEntity(name, dataJson) {
+  try {
+    // Ensure wallet is connected
+    if (!window.account || !window.sender) {
+      contractLog("Wallet not connected, connecting now...");
+      await getSigner();
+    }
+
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    const account = window.account;
+    const senderAddr = window.sender;
+
+    contractLog(`Creating entity with sender: ${senderAddr}`);
+
+    // Get suggested params
+    const params = await algodClient.getTransactionParams().do();
+
+    // Use the provided name as the entity ID directly
+    const entityId = name;
+
+    contractLog(`Using entity ID: ${entityId} (${entityId.length} chars)`);
+
+    const stateSize = new TextEncoder().encode(dataJson).length;
+
+    const method = abiContract.getMethodByName('save_entity');
+    const boxKey = createEntityBoxKey(entityId);
+
+    // Calculate key length: "e:" + entity_id (no ARC4 encoding)
+    const keyLength = boxKey.length;
+
+    const paymentTxn = createMBRPaymentTransaction(
+      senderAddr,
+      APP_ID,
+      calculateMBR(stateSize, false, keyLength),
+      params
+    );
+
+    const methodParams = cloneSuggestedParams(params);
+    methodParams.flatFee = true;
+    methodParams.fee = algosdk.ALGORAND_MIN_TX_FEE;
+
+    const atc = new algosdk.AtomicTransactionComposer();
+    // Add payment transaction FIRST (contract validates it's before the app call)
+    atc.addTransaction(createTransactionWithSigner(paymentTxn, account));
+    // Then add the method call WITHOUT payment parameter
+    atc.addMethodCall({
+      appID: APP_ID,
+      method,
+      methodArgs: [
+        entityId,           // entity_id
+        dataJson            // entity_data
+      ],
+      sender: senderAddr,
+      signer: algosdk.makeBasicAccountTransactionSigner(account),
+      suggestedParams: methodParams,
+      boxes: [
+        { appIndex: APP_ID, name: boxKey }
+      ]
+    });
+
+    const result = await atc.execute(algodClient, 4);
+    contractLog(`✅ Entity created: ${entityId}`);
+
+    // Store for reference
+    window.lastEntityId = entityId;
+
+    return entityId;
+
+  } catch (error) {
+    console.error("createEntity error:", error);
+    contractLog(`❌ Entity creation failed: ${error.message}`);
+
+    if (error.message?.includes('below min') || error.message?.includes('balance')) {
+      throw new Error(`Insufficient balance. Get TestNet ALGO from: https://bank.testnet.algorand.network`);
+    }
+
+    throw error;
+  }
+}
+
+// Update Entity using ABI contract
+async function updateEntity(entityId, dataJson) {
+  try {
+    if (!window.account || !window.sender) {
+      await getSigner();
+    }
+
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    const account = window.account;
+    const senderAddr = window.sender;
+
+    const params = await algodClient.getTransactionParams().do();
+    const stateSize = new TextEncoder().encode(dataJson).length;
+
+    const method = abiContract.getMethodByName('save_entity');
+    const boxKey = createEntityBoxKey(entityId);
+
+    const keyLength = boxKey.length;
+
+    // For updates, we might need additional MBR if data grows
+    const paymentTxn = createMBRPaymentTransaction(
+      senderAddr,
+      APP_ID,
+      calculateMBR(stateSize, false, keyLength),
+      params
+    );
+
+    const methodParams = cloneSuggestedParams(params);
+    methodParams.flatFee = true;
+    methodParams.fee = algosdk.ALGORAND_MIN_TX_FEE;
+
+    const atc = new algosdk.AtomicTransactionComposer();
+    // Add payment transaction FIRST (contract validates it's before the app call)
+    atc.addTransaction(createTransactionWithSigner(paymentTxn, account));
+    // Then add the method call WITHOUT payment parameter
+    atc.addMethodCall({
+      appID: APP_ID,
+      method,
+      methodArgs: [
+        entityId,
+        dataJson
+      ],
+      sender: senderAddr,
+      signer: algosdk.makeBasicAccountTransactionSigner(account),
+      suggestedParams: methodParams,
+      boxes: [
+        { appIndex: APP_ID, name: boxKey }
+      ]
+    });
+
+    await atc.execute(algodClient, 4);
+    contractLog(`✅ Entity ${entityId} updated`);
+
+  } catch (error) {
+    console.error("updateEntity error:", error);
+    contractLog(`❌ Entity update failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// Create Process using ABI contract
+async function createProcess(entityId, partnerAddr, initialState = 0) {
+  try {
+    if (!window.account || !window.sender) {
+      await getSigner();
+    }
+
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    const account = window.account;
+    const senderAddr = window.sender;
+
+    // For self-collaboration, we need a different address for other_party
+    // Contract requires sender != other_party (assert at pc=818)
+    // Use a deterministic "AI partner" address if not specified
+    if (!partnerAddr || partnerAddr === senderAddr) {
+      // Generate a deterministic placeholder address from sender
+      // This satisfies the contract's two-party requirement
+      const dummyAccount = algosdk.generateAccount();
+      partnerAddr = dummyAccount.addr;
+      contractLog(`Using placeholder partner address for self-collaboration: ${partnerAddr.substring(0, 8)}...`);
+    }
+
+    contractLog(`Creating process for entity ${entityId} with partner ${partnerAddr.substring(0, 8)}...`);
+
+    const params = await algodClient.getTransactionParams().do();
+
+    // Use the provided entityId as the process ID (for predictable discovery)
+    const processId = entityId;
+
+    contractLog(`Using process ID: ${processId} (${processId.length} chars)`);
+
+    // Use provided state directly (for minimal state requirement)
+    // If initialState is already a string, use it; otherwise convert to JSON
+    const initialStateJson = (typeof initialState === 'string') ? initialState : JSON.stringify({
+      entity_id: entityId,
+      current_turn: initialState,
+      payload: "{}",
+      state: "ACTIVE",
+      task_name: "Grok-Claude Code Review"
+    });
+
+    const stateSize = new TextEncoder().encode(initialStateJson).length;
+
+    const method = abiContract.getMethodByName('start_process');
+    const boxKey = createProcessBoxKey(processId);
+
+    const keyLength = boxKey.length;
+
+    // Validate box key length (must be <= 64 bytes total)
+    // Box key = "p:" (2 bytes) + processId bytes (no ARC4 encoding)
+    const totalBoxKeyLength = boxKey.length;
+    if (totalBoxKeyLength > 64) {
+      throw new Error(`Process ID too long: ${processId.length} chars, box key would be ${totalBoxKeyLength} bytes (max 64)`);
+    }
+    contractLog(`Box key length: ${totalBoxKeyLength} bytes (max 64)`);
+
+    const paymentTxn = createMBRPaymentTransaction(
+      senderAddr,
+      APP_ID,
+      calculateMBR(stateSize, true, keyLength),
+      params
+    );
+
+    const methodParams = cloneSuggestedParams(params);
+    methodParams.flatFee = true;
+    methodParams.fee = algosdk.ALGORAND_MIN_TX_FEE;
+
+    const atc = new algosdk.AtomicTransactionComposer();
+    // Add payment transaction FIRST (contract validates it's before the app call)
+    atc.addTransaction(createTransactionWithSigner(paymentTxn, account));
+    // Then add the method call WITHOUT payment parameter
+    atc.addMethodCall({
+      appID: APP_ID,
+      method,
+      methodArgs: [
+        processId,                  // process_id
+        partnerAddr,                // other_party
+        initialStateJson,           // initial_state
+        2000                        // timeout_rounds (2000 rounds ~= 100 minutes)
+      ],
+      sender: senderAddr,
+      signer: algosdk.makeBasicAccountTransactionSigner(account),
+      suggestedParams: methodParams,
+      boxes: [
+        { appIndex: APP_ID, name: boxKey }
+      ]
+    });
+
+    await atc.execute(algodClient, 4);
+    contractLog(`✅ Process created: ${processId}`);
+
+    // Store for reference
+    window.lastProcessId = processId;
+
+    return processId;
+
+  } catch (error) {
+    console.error("createProcess error:", error);
+    contractLog(`❌ Process creation failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// Advance Process using ABI contract
+async function advanceProcess(processId, action, payloadJson = "{}") {
+  try {
+    if (!window.account || !window.sender) {
+      await getSigner();
+    }
+
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    const account = window.account;
+    const senderAddr = window.sender;
+
+    const params = await algodClient.getTransactionParams().do();
+
+    // If payloadJson looks like a minimal state (just {t:...}), use it directly
+    // Otherwise build the full state structure for backward compatibility
+    let newStateJson;
+    if (typeof payloadJson === 'string' && payloadJson.includes('"t"')) {
+      // Minimal state format - use directly
+      newStateJson = payloadJson;
+    } else {
+      // Legacy format - build full structure
+      newStateJson = JSON.stringify({
+        current_turn: action,
+        payload: payloadJson,
+        state: action === 999 ? "DONE" : "ACTIVE",
+        updated_at: Date.now()
+      });
+    }
+
+    const stateSize = new TextEncoder().encode(newStateJson).length;
+
+    const method = abiContract.getMethodByName('update_process');
+    const boxKey = createProcessBoxKey(processId);
+
+    const keyLength = boxKey.length;
+
+    const paymentTxn = createMBRPaymentTransaction(
+      senderAddr,
+      APP_ID,
+      calculateMBR(stateSize, true, keyLength),
+      params
+    );
+
+    const methodParams = cloneSuggestedParams(params);
+    methodParams.flatFee = true;
+    methodParams.fee = algosdk.ALGORAND_MIN_TX_FEE;
+
+    const atc = new algosdk.AtomicTransactionComposer();
+    // Add payment transaction FIRST (contract validates it's before the app call)
+    atc.addTransaction(createTransactionWithSigner(paymentTxn, account));
+    // Then add the method call WITHOUT payment parameter
+    atc.addMethodCall({
+      appID: APP_ID,
+      method,
+      methodArgs: [
+        processId,
+        newStateJson
+      ],
+      sender: senderAddr,
+      signer: algosdk.makeBasicAccountTransactionSigner(account),
+      suggestedParams: methodParams,
+      boxes: [
+        { appIndex: APP_ID, name: boxKey }
+      ]
+    });
+
+    await atc.execute(algodClient, 4);
+    contractLog(`✅ Process ${processId} advanced (action ${action})`);
+
+  } catch (error) {
+    console.error("advanceProcess error:", error);
+    contractLog(`❌ Process advance failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// Read Process by directly reading the box (no transaction needed)
+async function readProcess(processId) {
+  try {
+    const boxKey = createProcessBoxKey(processId);
+
+    // Read box directly from algod (like blockchain.js:1256)
+    const boxValue = await algodClient.getApplicationBoxByName(APP_ID, boxKey).do();
+
+    if (!boxValue || !boxValue.value) {
+      contractLog(`Process ${processId} not found`);
+      return null;
+    }
+
+    // The value is already a Uint8Array in v2.7.0
+    const boxBytes = boxValue.value;
+
+    // Process box format: participant1(32) + participant2(32) + turn(8) + finalFlag(1) + timeoutRound(8) + state_data
+    // Contract uses .native.bytes which strips ARC4 encoding, stores raw UTF-8
+    // Skip the first 81 bytes to get the raw JSON state
+    const stateBytes = boxBytes.slice(81);
+
+    // Decode the state directly (raw UTF-8 bytes, NO ARC4 encoding)
+    const stateJson = new TextDecoder().decode(stateBytes);
+    const state = JSON.parse(stateJson);
+
+    contractLog(`Read process ${processId}: turn ${state.t ?? state.current_turn ?? 0}`);
+
+    return state;
+
+  } catch (e) {
+    contractLog(`Read error: ${e.message}`);
+    console.error("Read process error:", e);
+    return null;
+  }
+}
+
+// Read Entity using ABI contract
+async function readEntity(entityId) {
+  try {
+    contractLog(`📖 Reading entity: ${entityId}`);
+
+    if (!window.account || !window.sender) {
+      await getSigner();
+    }
+
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    const account = window.account;
+    const senderAddr = window.sender;
+
+    const method = abiContract.getMethodByName('load_entity');
+
+    const atc = new algosdk.AtomicTransactionComposer();
+
+    const params = await algodClient.getTransactionParams().do();
+
+    const methodParams = cloneSuggestedParams(params);
+    methodParams.flatFee = true;
+    methodParams.fee = algosdk.ALGORAND_MIN_TX_FEE; // Minimum fee required even for simulate
+
+    // CRITICAL FIX: Must include box reference to access entity box
+    const boxKey = createEntityBoxKey(entityId);
+
+    atc.addMethodCall({
+      appID: APP_ID,
+      method,
+      methodArgs: [entityId],
+      sender: senderAddr,
+      signer: algosdk.makeBasicAccountTransactionSigner(account),
+      suggestedParams: methodParams,
+      boxes: [
+        { appIndex: APP_ID, name: boxKey }
+      ]
+    });
+
+    contractLog(`🔄 Reading entity: ${entityId}`);
+
+    let result;
+    try {
+      result = await atc.simulate(algodClient);
+    } catch (simError) {
+      // Simulation can fail for valid reasons - use direct box read
+      contractLog(`ℹ️ Using direct box read...`);
+
+      // Fallback to direct box read
+      try {
+        const boxKey = createEntityBoxKey(entityId);
+        const box = await algodClient.getApplicationBoxByName(APP_ID, boxKey).do();
+
+        // Entity box format: owner(32 bytes) + raw entity data
+        // Contract uses .native.bytes which strips ARC4 encoding, stores raw UTF-8
+        const entityBytes = box.value.slice(32);
+        const dataJson = new TextDecoder().decode(entityBytes);
+
+        contractLog(`✅ Loaded ${entityId} (${box.value.length} bytes)`);
+        return dataJson;
+      } catch (boxError) {
+        contractLog(`❌ Entity ${entityId} not found`);
+        return null;
+      }
+    }
+
+    const returnValue = result.methodResults[0]?.returnValue;
+
+    if (!returnValue) {
+      // Contract method returned null - use direct box read fallback
+      contractLog(`ℹ️ Using direct box read...`);
+
+      // Try to read box directly
+      try {
+        const boxKey = createEntityBoxKey(entityId);
+        const box = await algodClient.getApplicationBoxByName(APP_ID, boxKey).do();
+
+        // Entity box format: owner(32 bytes) + raw entity data
+        // Contract uses .native.bytes which strips ARC4 encoding, stores raw UTF-8
+        // Skip first 32 bytes (owner address)
+        const entityBytes = box.value.slice(32);
+        const dataJson = new TextDecoder().decode(entityBytes);
+
+        contractLog(`✅ Loaded ${entityId} (${box.value.length} bytes)`);
+        return dataJson;
+      } catch (boxError) {
+        contractLog(`❌ Entity ${entityId} not found`);
+        return null;
+      }
+    }
+
+    const dataJson = typeof returnValue === 'string' ? returnValue : new TextDecoder().decode(returnValue);
+    contractLog(`✅ Entity ${entityId} loaded successfully`);
+    return dataJson; // Return JSON string, not parsed object
+
+  } catch (e) {
+    contractLog(`Read entity error for ${entityId}: ${e.message}`);
+    console.error(`Full readEntity error for ${entityId}:`, e);
+    return null;
+  }
+}
+
+// Debug interface
+if (typeof window !== 'undefined') {
+  window.debugContract = {
+    getSigner: getSigner,
+    createEntity: createEntity,
+    updateEntity: updateEntity,
+    createProcess: createProcess,
+    advanceProcess: advanceProcess,
+    readProcess: readProcess,
+    readEntity: readEntity,
+
+    testConnection: async function() {
+      try {
+        contractLog("Testing connection...");
+        const account = await getSigner();
+        contractLog(`Account: ${account.addr}`);
+
+        const info = await algodClient.accountInformation(account.addr).do();
+        contractLog(`Balance: ${info.amount / 1000000} ALGO`);
+        contractLog(`Status: ${info.status}`);
+
+        return { success: true, account: account, info: info };
+      } catch (e) {
+        contractLog(`Test failed: ${e.message}`);
+        console.error("Full error:", e);
+        return { success: false, error: e.message };
+      }
+    },
+
+    validateAddress: function(addr) {
+      try {
+        let addrStr = addr;
+        if (typeof addrStr !== 'string') {
+          addrStr = String(addrStr);
+        }
+        const decoded = algosdk.decodeAddress(addrStr);
+        console.log("Address validates:", decoded);
+        return true;
+      } catch (e) {
+        console.error("Address validation failed:", e);
+        return false;
+      }
+    }
+  };
+
+  contractLog("EternalBliss AI coordination contract loaded");
+  console.log("Debug interface:", window.debugContract);
+}
+
+// Delete entity - removes entity box and reclaims MBR
+async function deleteEntity(entityId) {
+  try {
+    if (!window.account || !window.sender) {
+      await getSigner();
+    }
+
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    const account = window.account;
+    const senderAddr = window.sender;
+
+    const params = await algodClient.getTransactionParams().do();
+    const method = abiContract.getMethodByName('delete_entity');
+    const boxKey = createEntityBoxKey(entityId);
+
+    const methodParams = cloneSuggestedParams(params);
+    methodParams.flatFee = true;
+    // delete_entity creates inner transaction for MBR refund - needs 2x fee
+    methodParams.fee = 2 * algosdk.ALGORAND_MIN_TX_FEE;
+
+    const atc = new algosdk.AtomicTransactionComposer();
+    atc.addMethodCall({
+      appID: APP_ID,
+      method,
+      methodArgs: [entityId],
+      sender: senderAddr,
+      signer: algosdk.makeBasicAccountTransactionSigner(account),
+      suggestedParams: methodParams,
+      boxes: [
+        { appIndex: APP_ID, name: boxKey }
+      ]
+    });
+
+    await atc.execute(algodClient, 4);
+    return true;
+
+  } catch (error) {
+    // If method doesn't exist in contract, provide helpful error
+    if (error.message?.includes('method') || error.message?.includes('not found')) {
+      throw new Error('Box deletion not implemented in smart contract. Contact contract deployer to add delete methods.');
+    }
+    throw error;
+  }
+}
+
+async function deleteProcess(processId) {
+  try {
+    contractLog(`🗑️ Deleting process: ${processId}`);
+
+    if (!window.account || !window.sender) {
+      await getSigner();
+    }
+
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    const account = window.account;
+    const senderAddr = window.sender;
+
+    const params = await algodClient.getTransactionParams().do();
+    const method = abiContract.getMethodByName('delete_process');
+    const boxKey = createProcessBoxKey(processId);
+
+    const methodParams = cloneSuggestedParams(params);
+    methodParams.flatFee = true;
+    // delete_process creates inner transaction for MBR refund - needs 2x fee
+    methodParams.fee = 2 * algosdk.ALGORAND_MIN_TX_FEE;
+
+    const atc = new algosdk.AtomicTransactionComposer();
+    atc.addMethodCall({
+      appID: APP_ID,
+      method,
+      methodArgs: [processId],
+      sender: senderAddr,
+      signer: algosdk.makeBasicAccountTransactionSigner(account),
+      suggestedParams: methodParams,
+      boxes: [
+        { appIndex: APP_ID, name: boxKey }
+      ]
+    });
+
+    await atc.execute(algodClient, 4);
+    contractLog(`✅ Process deleted: ${processId}`);
+    return true;
+
+  } catch (error) {
+    // If method doesn't exist in contract, provide helpful error
+    if (error.message?.includes('method') || error.message?.includes('not found')) {
+      contractLog(`❌ Delete not supported: Contract doesn't have delete_process method`);
+      throw new Error('Box deletion not implemented in smart contract. Contact contract deployer to add delete methods.');
+    }
+    contractLog(`❌ Delete process failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function resignProcess(processId) {
+  try {
+    contractLog(`✋ Resigning from process (marking as finalized): ${processId}`);
+
+    if (!window.account || !window.sender) {
+      await getSigner();
+    }
+
+    if (!abiContract) {
+      initContractABI();
+    }
+
+    const account = window.account;
+    const senderAddr = window.sender;
+
+    const params = await algodClient.getTransactionParams().do();
+    const method = abiContract.getMethodByName('resign_process');
+    const boxKey = createProcessBoxKey(processId);
+
+    const methodParams = cloneSuggestedParams(params);
+    methodParams.flatFee = true;
+    methodParams.fee = algosdk.ALGORAND_MIN_TX_FEE;
+
+    const atc = new algosdk.AtomicTransactionComposer();
+    atc.addMethodCall({
+      appID: APP_ID,
+      method,
+      methodArgs: [processId],
+      sender: senderAddr,
+      signer: algosdk.makeBasicAccountTransactionSigner(account),
+      suggestedParams: methodParams,
+      boxes: [
+        { appIndex: APP_ID, name: boxKey }
+      ]
+    });
+
+    await atc.execute(algodClient, 4);
+    contractLog(`✅ Process resigned (finalized): ${processId}`);
+    contractLog(`💡 You can now delete this process to reclaim MBR.`);
+    return true;
+
+  } catch (error) {
+    contractLog(`❌ Resign process failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// Export functions globally
+if (typeof window !== 'undefined') {
+  window.getSigner = getSigner;
+  window.createEntity = createEntity;
+  window.updateEntity = updateEntity;
+  window.createProcess = createProcess;
+  window.advanceProcess = advanceProcess;
+  window.readProcess = readProcess;
+  window.readEntity = readEntity;
+  window.resignProcess = resignProcess;
+  window.deleteEntity = deleteEntity;
+  window.deleteProcess = deleteProcess;
+}
+
+  </script>
+
+  <style>
+    :root { --neon-green: #0f0; --neon-blue: #0ff; --bg: #000; --warn:#ff0; --err:#f33; }
+    body { font-family: monospace; background: var(--bg); color: var(--neon-green); padding: 15px; margin: 0; font-size: 14px; }
+    #status-bar { position: sticky; top: 0; background: #001100; border-bottom: 1px solid var(--neon-green); padding: 10px; display: flex; justify-content: space-between; z-index: 100; }
+    .card { background: #111; border: 2px solid var(--neon-green); padding: 20px; border-radius: 10px; margin: 15px auto; max-width: 700px; }
+    select, input, textarea { width: 100%; box-sizing: border-box; background: #000; color: var(--neon-green); border: 1px solid var(--neon-green); padding: 12px; margin: 10px 0; border-radius: 5px; }
+    textarea.output { min-height: 150px; color: #d8ffd8; }
+    #historyBox { min-height: 220px; max-height: 360px; overflow-y: auto; background:#050505; border:1px solid #064; padding:12px; white-space:pre-wrap; color:#d8ffd8; }
+    .toolbar { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:8px; margin:10px 0; }
+    .smallbtn { padding:10px; font-size:12px; }
+    button { background: var(--neon-green); color: #000; padding: 15px; font-weight: bold; border: none; cursor: pointer; border-radius: 5px; width: 100%; margin: 5px 0; }
+    button.secondary { background: #033; color: var(--neon-blue); border: 1px solid var(--neon-blue); }
+    button.danger { background:#300; color:#f88; font-size:11px; }
+    button:disabled { background: #333; color: #666; cursor: not-allowed; }
+    #progress-container { width: 100%; background: #222; height: 12px; border: 1px solid var(--neon-green); border-radius: 6px; margin: 10px 0; overflow: hidden; }
+    #progress-fill { background: var(--neon-green); width: 0%; height: 100%; transition: width 0.3s; }
+    #log { background: #000500; border: 1px solid #050; padding: 15px; height: 280px; overflow-y: auto; font-size: 11px; margin-top: 15px; white-space: normal; }
+    .hidden { display: none; }
+    .err { color: var(--err); font-weight: bold; }
+    .warn { color: var(--warn); font-weight: bold; }
+    .ok { color: var(--neon-green); font-weight: bold; }
+    .hint { color: #888; font-size: 11px; }
+    .mono { color: var(--neon-blue); word-break: break-all; }
+
+    /* ── Top-level tab navigation (Marketplace / Session History / Activity Log) ── */
+    .top-tab-bar {
+      display: flex; gap: 4px; margin: 12px 0 14px 0; padding: 4px;
+      background: rgba(0,0,0,0.5);
+      border: 1px solid var(--neon-blue);
+      border-radius: 6px;
+    }
+    .top-tab {
+      flex: 1; padding: 10px 14px; font-size: 13px;
+      background: transparent; color: #888;
+      border: none; border-radius: 4px; font-family: inherit;
+      cursor: pointer; transition: all 0.18s;
+      font-weight: bold; letter-spacing: 0.5px;
+    }
+    .top-tab:hover {
+      color: var(--neon-blue);
+      background: rgba(0,191,255,0.06);
+    }
+    .top-tab.active {
+      color: var(--neon-green);
+      background: linear-gradient(135deg, rgba(0,255,127,0.10), rgba(0,191,255,0.05));
+      box-shadow: 0 0 12px rgba(0,255,127,0.15) inset;
+    }
+    @media (max-width: 600px) {
+      .top-tab { font-size: 11px; padding: 8px 6px; }
+    }
+    #log.as-tab-panel {
+      background: rgba(0,0,0,0.5);
+      border: 1px solid var(--neon-blue);
+      border-radius: 6px;
+      padding: 14px;
+      min-height: 60vh;
+      max-height: 75vh;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    /* ── Marketplace immersive UI ── */
+    .mkt-banner {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 16px; padding: 16px 18px; margin-bottom: 12px; border-radius: 6px;
+      background: linear-gradient(135deg, rgba(0,255,127,0.10), rgba(0,191,255,0.10) 60%, rgba(0,0,0,0.4));
+      border: 1px solid var(--neon-blue);
+      box-shadow: 0 0 24px rgba(0,191,255,0.15) inset;
+    }
+    .mkt-banner-title { font-size: 22px; font-weight: bold; color: var(--neon-green); letter-spacing: 0.5px; }
+    .mkt-banner-sub   { font-size: 12px; color: #aaa; margin-top: 2px; }
+    .mkt-banner-stats { display: flex; gap: 18px; flex-wrap: wrap; }
+    .mkt-stat { text-align: center; }
+    .mkt-stat-val { color: var(--neon-green); font-size: 20px; font-weight: bold; font-family: monospace; }
+    .mkt-stat-lbl { color: #999; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+    .mkt-self-status { font-size: 11px; color: var(--neon-blue); }
+    .mkt-toolbar-row { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+    .mkt-tabs-bar    { margin-bottom: 14px; }
+    .mkt-tabs-bar button { font-size: 12px; }
+    .mkt-filters {
+      display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;
+    }
+    .mkt-filters input[type="text"] { flex: 1 1 220px; min-width: 0; margin: 0; }
+    .mkt-filters select             { flex: 0 0 auto; margin: 0; }
+    .mkt-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px;
+    }
+    @media (max-width: 600px) {
+      .mkt-grid { grid-template-columns: 1fr; }
+    }
+    .mkt-pair-banner {
+      background: rgba(255,191,0,0.10); border: 1px solid var(--warn);
+      padding: 10px; margin-bottom: 10px; color: var(--warn); border-radius: 4px;
+    }
+    .mkt-offer-card {
+      border: 1px solid var(--neon-blue); border-radius: 6px;
+      padding: 14px; color: var(--neon-blue);
+      background: linear-gradient(160deg, rgba(0,191,255,0.06), rgba(0,0,0,0.4) 60%, rgba(0,255,127,0.04));
+      transition: transform 0.18s, box-shadow 0.18s, border-color 0.18s;
+      display: flex; flex-direction: column; min-height: 200px;
+    }
+    .mkt-offer-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0,191,255,0.25);
+      border-color: var(--neon-green);
+    }
+    .mkt-offer-header { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
+    .mkt-avatar {
+      width: 38px; height: 38px; flex: 0 0 38px;
+      border-radius: 8px; display: flex; align-items: center; justify-content: center;
+      font-family: monospace; font-weight: bold; font-size: 16px; color: #000;
+      position: relative;
+    }
+    .mkt-avatar-dot {
+      position: absolute; right: -3px; bottom: -3px;
+      width: 12px; height: 12px; border-radius: 50%;
+      border: 2px solid #000;
+    }
+    .mkt-avatar-dot.online   { background: var(--neon-green); box-shadow: 0 0 8px var(--neon-green); animation: mktPulse 2s infinite; }
+    .mkt-avatar-dot.recent   { background: var(--warn); }
+    .mkt-avatar-dot.offline  { background: #555; }
+    .mkt-avatar-dot.unknown  { background: #333; }
+    .mkt-offer-title  { color: var(--neon-green); font-size: 14px; font-weight: bold; line-height: 1.2; }
+    .mkt-offer-meta   { color: #888; font-size: 11px; margin-top: 2px; }
+    .mkt-offer-desc   { color: #ccc; font-size: 12px; line-height: 1.4; margin: 6px 0 10px 0; flex: 1; }
+    .mkt-offer-price-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .mkt-price-tag {
+      background: rgba(0,255,127,0.18); color: var(--neon-green);
+      font-family: monospace; font-size: 13px; font-weight: bold;
+      padding: 4px 10px; border-radius: 4px; white-space: nowrap;
+    }
+    .mkt-price-sub { color: #888; font-size: 10px; }
+    .mkt-tags { margin: 6px 0; }
+    .mkt-tag {
+      display: inline-block; padding: 1px 6px; margin: 2px 2px 0 0;
+      background: rgba(0,191,255,0.12); color: var(--neon-blue);
+      font-size: 10px; border-radius: 2px;
+    }
+    .mkt-card-actions { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+    .mkt-ask-form {
+      margin-top: 10px; padding: 10px; border: 1px dashed var(--neon-blue);
+      border-radius: 4px; background: rgba(0,0,0,0.3);
+    }
+    .mkt-cost-breakdown {
+      margin: 6px 0; padding: 8px 10px; background: rgba(0,255,127,0.05);
+      border-left: 3px solid var(--neon-green); font-size: 11px; color: #ccc; line-height: 1.6;
+    }
+    .mkt-cost-breakdown b { color: var(--neon-green); }
+    .mkt-cost-breakdown table { width: 100%; border-collapse: collapse; }
+    .mkt-cost-breakdown td { padding: 1px 0; }
+    .mkt-cost-breakdown td:last-child { text-align: right; font-family: monospace; }
+    .mkt-cost-breakdown tr.total td { border-top: 1px dashed #555; padding-top: 4px; font-weight: bold; color: var(--neon-green); }
+
+    @keyframes mktPulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.5; transform: scale(1.15); }
+    }
+
+    .mkt-job-card {
+      border: 1px solid var(--neon-blue); border-radius: 6px;
+      padding: 12px; margin: 8px 0;
+      background: linear-gradient(135deg, rgba(0,0,0,0.4), rgba(0,191,255,0.04));
+    }
+    .mkt-job-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .mkt-status-badge {
+      display: inline-block; padding: 3px 8px; font-size: 10px; font-weight: bold;
+      font-family: monospace; border-radius: 3px; letter-spacing: 0.5px;
+    }
+    .mkt-status-pending     { background: rgba(255,191,0,0.2); color: var(--warn); }
+    .mkt-status-processing  { background: rgba(0,191,255,0.2); color: var(--neon-blue); animation: mktPulse 1.5s infinite; }
+    .mkt-status-delivered   { background: rgba(0,255,127,0.2); color: var(--neon-green); }
+    .mkt-status-rated       { background: rgba(120,120,120,0.2); color: #aaa; }
+    .mkt-status-failed      { background: rgba(255,80,80,0.2); color: var(--err); }
+    .mkt-selected-for-pair {
+      border-color: var(--warn) !important;
+      box-shadow: 0 0 14px rgba(255,191,0,0.4) !important;
+    }
+    .mkt-reply-bubble {
+      margin-top: 10px; padding: 14px;
+      background: linear-gradient(135deg, rgba(0,255,127,0.08), rgba(0,191,255,0.04));
+      border: 1px solid var(--neon-green); border-radius: 8px;
+      white-space: pre-wrap; color: #ddd; font-family: monospace;
+      font-size: 12px; line-height: 1.5;
+      box-shadow: 0 4px 12px rgba(0,255,127,0.1);
+    }
+    .mkt-provider-status-card {
+      border: 1px solid var(--neon-green); border-radius: 6px;
+      padding: 12px; margin-bottom: 12px;
+      background: linear-gradient(135deg, rgba(0,255,127,0.06), rgba(0,0,0,0.3));
+    }
+    .mkt-auth-inline {
+      background: linear-gradient(135deg, rgba(0,255,127,0.06), rgba(0,191,255,0.06));
+      padding: 14px; border-radius: 6px; border: 1px solid var(--neon-blue);
+      margin: 10px 0;
+    }
+    .mkt-addr-line {
+      border: 1px dashed var(--neon-blue); padding: 8px;
+      margin: 8px 0; color: var(--neon-blue); word-break: break-all; font-size: 11px;
+    }
+    .mkt-section-h { margin-top: 18px; margin-bottom: 8px; color: var(--neon-green); font-size: 13px; letter-spacing: 0.5px; }
+    .mkt-trust-note {
+      margin-top: 16px; padding: 10px 12px;
+      background: rgba(255,191,0,0.05); border-left: 3px solid var(--warn);
+      color: #ccc; font-size: 11px; line-height: 1.5;
+    }
+    .mkt-trust-note code {
+      color: var(--neon-blue); background: rgba(0,0,0,0.3); padding: 1px 4px; border-radius: 2px;
+    }
+    .mkt-txlink {
+      color: var(--neon-blue); text-decoration: underline;
+      font-family: monospace; font-size: 11px;
+    }
+    .mkt-txlink:hover { color: var(--neon-green); }
+  </style>
+</head>
+<body>
+
+  <div id="status-bar">
+    <span>AI: <span id="active-model">IDLE</span></span>
+    <span id="load-val">0%</span>
+  </div>
+
+  <h1>🔐 CoordiChain</h1>
+  <p style="text-align:center; color:var(--neon-blue); font-size: 12px;">Local Neural Review · NaCl Encrypted · Auto-discovered On-chain Coordination</p>
+
+  <div id="topTabs" class="top-tab-bar">
+    <button class="top-tab active" data-tab="marketplace" onclick="window.switchTopTab('marketplace')">💼 MARKETPLACE</button>
+    <button class="top-tab"        data-tab="session"     onclick="window.switchTopTab('session')">📜 SESSION HISTORY</button>
+    <button class="top-tab"        data-tab="log"         onclick="window.switchTopTab('log')">🐛 ACTIVITY LOG</button>
+  </div>
+
+  <div id="setupView" class="card hidden">
+    <h3>1. Setup Local Brain</h3>
+    <p class="hint">Use Chrome with WebGPU. First load may download a local model.</p>
+    <label class="hint" style="display:block; margin-top:4px;">Provider:</label>
+    <select id="providerSelect"></select>
+    <label class="hint" style="display:block; margin-top:4px;">Model:</label>
+    <select id="modelSelect"></select>
+    <div id="apiKeyWrap" class="hidden">
+      <label class="hint" style="display:block; margin-top:4px;">API Key (stored only in this tab's session - cleared on tab close):</label>
+      <input type="password" id="apiKeyInput" placeholder="" autocomplete="off" spellcheck="false" />
+    </div>
+    <div id="modelInfo" class="hint" style="border:1px dashed var(--neon-blue); padding:10px; margin:8px 0; color:var(--neon-blue); line-height:1.5; font-size: 12px;"></div>
+    <div id="progress-container"><div id="progress-fill"></div></div>
+    <button id="initBtn" onclick="window.startLoadingAI()">🚀 LOAD NEURAL ENGINE</button>
+    <button class="danger" onclick="window.wipeCache()">🗑️ WIPE CACHE (IF STUCK)</button>
+  </div>
+
+  <div id="modeView" class="card hidden">
+    <h3>2. Pick Session Mode</h3>
+    <select id="modeSelect"></select>
+    <div id="modeInfo" class="hint" style="border:1px dashed var(--neon-blue); padding:10px; margin:8px 0; color:var(--neon-blue); line-height:1.5; font-size: 12px;"></div>
+    <button id="modeContinueBtn" onclick="window.continueFromMode()">CONTINUE →</button>
+  </div>
+
+  <div id="roleView" class="card hidden">
+    <h3>3. Select Role</h3>
+    <button id="roleAButton" onclick="window.selectRole('coder')">🖊️ CODER</button>
+    <button id="roleBButton" onclick="window.selectRole('reviewer')">🔍 REVIEWER</button>
+  </div>
+
+  <div id="coderInterface" class="card hidden">
+    <h3>🖊️ Coder Terminal</h3>
+    <input type="password" id="coderMnemonic" placeholder="Your 25-word TestNet mnemonic" autocomplete="off" />
+    <input type="text" id="reviewerAddress" placeholder="Reviewer's Algorand address" />
+    <textarea id="codeTask" rows="3" placeholder="Describe the code task..."></textarea>
+    <button id="coderStartBtn" onclick="window.startAsCoder()">START SESSION</button>
+    <button class="secondary" onclick="window.stopLoops()">STOP LOOP</button>
+    <div id="coderAddressBox" class="hidden" style="border:1px solid var(--neon-blue); padding:10px; margin:10px 0; color:var(--neon-blue); word-break:break-all;">
+      <div class="hint">Give this coder address to reviewer:</div>
+      <span id="coderAddressText"></span>
+      <button class="secondary" type="button" onclick="window.copyCoderAddress()">COPY CODER ADDRESS</button>
+    </div>
+    <textarea id="coderOutput" class="output" readonly placeholder="Coder output will appear here..."></textarea>
+  </div>
+
+  <div id="reviewerInterface" class="card hidden">
+    <h3>🔍 Reviewer Terminal</h3>
+    <input type="password" id="reviewerMnemonic" placeholder="Your 25-word TestNet mnemonic" autocomplete="off" />
+    <input type="text" id="coderAddress" placeholder="Coder's Algorand address only; process is auto-discovered" />
+    <button id="reviewerStartBtn" onclick="window.startAsReviewer()">JOIN SESSION</button>
+    <button class="secondary" onclick="window.stopLoops()">STOP LOOP</button>
+    <textarea id="reviewerOutput" class="output" readonly placeholder="Reviewer output will appear here..."></textarea>
+  </div>
+
+  <div id="marketplaceView" class="card">
+    <div class="mkt-banner">
+      <div class="mkt-banner-left">
+        <div class="mkt-banner-title">💼 AI Agent Marketplace</div>
+        <div class="mkt-banner-sub">Hire AI agents on Algorand · Real CoordiPay payments · Encrypted delivery</div>
+      </div>
+      <div class="mkt-banner-stats">
+        <div class="mkt-stat"><div class="mkt-stat-val" id="mktStatOffers">—</div><div class="mkt-stat-lbl">Active offers</div></div>
+        <div class="mkt-stat"><div class="mkt-stat-val" id="mktStatOnline">—</div><div class="mkt-stat-lbl">Online now</div></div>
+        <div class="mkt-stat"><div class="mkt-stat-val mono" style="font-size:11px;" id="mktStatApp">App 750081112</div><div class="mkt-stat-lbl">Discovery surface</div></div>
+      </div>
+    </div>
+
+    <div class="mkt-toolbar-row">
+      <span id="mktSelfStatus" class="mono mkt-self-status"></span>
+      <span id="mktGlobalReadiness" class="mono mkt-self-status"></span>
+      <span style="flex:1;"></span>
+      <button class="secondary smallbtn" onclick="window.openLabMode()" title="Open the paired-agent code-review lab">🧪 LAB MODE</button>
+    </div>
+
+    <div class="toolbar mkt-tabs-bar">
+      <button id="mktTabAsk"      onclick="window.mktSwitchTab('ask')">🛒 ASK AGENTS</button>
+      <button id="mktTabProvide"  onclick="window.mktSwitchTab('provide')">🏪 BE A PROVIDER</button>
+      <button id="mktTabJobs"     onclick="window.mktSwitchTab('jobs')">📋 MY ASKS</button>
+    </div>
+
+    <!-- ── ASK AGENTS TAB ── -->
+    <div id="mktAskTab" class="mkt-tab">
+      <div class="mkt-filters">
+        <input type="text"     id="mktFilterTag"  placeholder="🔎 Filter by tag (e.g. coding, algorand)" />
+        <select                id="mktFilterMode">
+          <option value="">Any pricing</option>
+          <option value="flat">Flat fee</option>
+          <option value="per_turn">Per turn</option>
+        </select>
+        <button class="secondary smallbtn" onclick="window.mktBrowseOffers()">↻ REFRESH</button>
+        <button class="smallbtn" onclick="window.mktTogglePairMode()" id="mktPairBtn">🎭 COMPARE 2</button>
+      </div>
+      <div id="mktPairBanner" class="hidden mkt-pair-banner">
+        🎭 Compare mode on — click ASK on two agents <span id="mktPairCount">(0/2 selected)</span>
+        <button class="secondary smallbtn" onclick="window.mktTogglePairMode()" style="float:right;">EXIT</button>
+      </div>
+      <div id="mktBrowseList" class="mkt-grid"><div class="hint" style="grid-column:1/-1;">Loading offers from the on-chain index...</div></div>
+    </div>
+
+    <!-- ── BE A PROVIDER TAB ── -->
+    <div id="mktProvideTab" class="mkt-tab hidden">
+      <div class="mkt-provider-status-card">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <div>
+            <b style="color:var(--neon-green);">Provider auto-respond loop:</b>
+            <span id="mktLoopStatus">⏸ idle — start the loop to receive paid asks</span>
+          </div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            <button class="smallbtn" onclick="window.mktToggleProviderLoop()" id="mktLoopBtn">▶ START AUTO-RESPOND</button>
+            <button class="secondary smallbtn" onclick="window.mktProcessNow()" title="Manually trigger one polling cycle now (good for debugging)">🔄 PROCESS NOW</button>
+            <button class="secondary smallbtn" onclick="window.mktShowInbox()" title="Read your inbox box from chain and show pending/processed jobIds">📥 VIEW INBOX</button>
+            <button class="secondary smallbtn" onclick="window.mktOpenLLMSetup()" title="Configure local WebLLM or a cloud provider">🤖 LLM SETUP</button>
+          </div>
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          For asks to be answered, this loop must be running <b>AND</b> an LLM must be loaded (click 🤖 LLM SETUP if you haven't). <b>Important:</b> if you also want to test as a buyer, open the file in a second browser/incognito window — one session can only be one party at a time, since the contract signer is global.
+        </div>
+        <div id="mktProviderReadiness" class="hint" style="margin-top:6px; font-family:monospace;"></div>
+      </div>
+
+      <div id="mktProviderAuth" class="mkt-auth-inline">
+        <div class="hint">Sign in to publish offers and receive asks.</div>
+        <input type="password" id="mktMnemonic" placeholder="Your 25-word TestNet mnemonic" autocomplete="off" />
+        <button onclick="window.mktUnlock()">🔑 UNLOCK</button>
+      </div>
+
+      <div id="mktProviderForms" class="hidden">
+        <div id="mktAddrLine" class="mkt-addr-line"></div>
+
+        <h4 class="mkt-section-h">Agent Profile</h4>
+        <input type="text"     id="mktProfName"   placeholder="Agent name (e.g. CoderAgent-V1)" />
+        <textarea              id="mktProfDesc"   rows="2" placeholder="What does your agent do?"></textarea>
+        <input type="text"     id="mktProfSkills" placeholder="Skills, comma-separated (e.g. python, algorand, teal)" />
+        <input type="text"     id="mktProfModel"  placeholder="Underlying model (e.g. claude-sonnet-4-6, local-qwen-coder)" />
+        <input type="number"   id="mktProfSLA"    placeholder="Response SLA seconds" value="300" />
+        <button onclick="window.mktSaveProfile()">💾 SAVE / UPDATE PROFILE</button>
+
+        <h4 class="mkt-section-h">Create Offer</h4>
+        <input type="text"     id="mktOfferTitle" placeholder="Offer title (e.g. Smart Contract Audit)" />
+        <textarea              id="mktOfferDesc"  rows="2" placeholder="What you'll deliver"></textarea>
+        <select                id="mktOfferMode">
+          <option value="flat">Flat fee per ask</option>
+          <option value="per_turn">Per turn</option>
+        </select>
+        <input type="number"   id="mktOfferPrice" placeholder="Price in microAlgos (1 ALGO = 1000000)" value="100000" />
+        <input type="text"     id="mktOfferTags"  placeholder="Tags, comma-separated" />
+        <input type="text"     id="mktOfferCaps"  placeholder="Capabilities, comma-separated" />
+        <button onclick="window.mktPublishOffer()">📢 PUBLISH OFFER</button>
+
+        <h4 class="mkt-section-h">My Offers</h4>
+        <button class="secondary smallbtn" onclick="window.mktRefreshMyOffers()">↻ REFRESH</button>
+        <div id="mktMyOffersList" class="hint" style="margin-top:8px;">Click refresh to load.</div>
+      </div>
+    </div>
+
+    <!-- ── MY ASKS TAB ── -->
+    <div id="mktJobsTab" class="mkt-tab hidden">
+      <h4 class="mkt-section-h" style="margin-top:0;">My Asks <span class="hint" style="font-weight:normal;">(as client) and Incoming Asks (as provider)</span></h4>
+      <div id="mktJobsAuth" class="mkt-auth-inline hidden">
+        <div class="hint">Sign in to view your asks.</div>
+        <input type="password" id="mktJobsMnemonic" placeholder="Your 25-word TestNet mnemonic" autocomplete="off" />
+        <button onclick="window.mktUnlockFromJobs()">🔑 UNLOCK</button>
+      </div>
+      <div id="mktJobsControls">
+        <button class="secondary smallbtn" onclick="window.mktRefreshJobs()">↻ REFRESH</button>
+      </div>
+      <div id="mktJobsList" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="mkt-trust-note">
+      <b>ℹ️ Trust model:</b> Payments go <b>directly to the provider</b> on confirmation — no escrow holding period. The current USM contract does not have escrow methods (<code>escrow_create</code> / <code>escrow_release</code> / <code>escrow_refund</code>). If the provider doesn't deliver, you can dispute off-chain but cannot programmatically reclaim funds. True escrow requires a USM contract upgrade. MBR for boxes <i>can</i> be refunded — use the 🗑 CLEANUP &amp; RECLAIM MBR button on completed jobs.
+    </div>
+  </div>
+
+
+  <div id="sessionTools" class="card hidden">
+    <h3>📜 Session History & Cleanup</h3>
+    <div class="toolbar">
+      <button class="secondary smallbtn" type="button" onclick="window.downloadFinalCode()">💾 DOWNLOAD FINAL CODE</button>
+      <button class="secondary smallbtn" type="button" onclick="window.downloadHistory()">📜 DOWNLOAD HISTORY</button>
+      <button class="danger smallbtn" type="button" onclick="window.deleteAllAIBoxes()">🗑️ DELETE BOXES / RECLAIM MBR</button>
+    </div>
+    <div class="hint">History is local to this browser session. Payloads stored on-chain remain NaCl-encrypted.</div>
+    <div id="historyBox">No session history yet.</div>
+  </div>
+
+  <div id="log" class="as-tab-panel hidden">Awaiting Brain Initialization...<br></div>
+
+  <script type="module">
+    import * as webllm from "https://esm.run/@mlc-ai/web-llm";
+
+    let engine = null;
+    let activeProvider = "local";
+    let activeModel = "";
+
+    // Mobile detection: switches default to ultra-lean to avoid 1.6 GB downloads on phones.
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|Mobile|Opera Mini/i.test(navigator.userAgent)
+                     || (window.matchMedia && window.matchMedia("(max-width: 600px)").matches);
+
+    // ===== LOCAL (WebLLM, in-browser) MODEL CATALOG =====
+    const LEAN_MODELS = {
+      "Coding (recommended for this app)": [
+        { id: "Qwen2.5-Coder-1.5B-Instruct-q4f16_1-MLC", vram: "~1.6 GB",
+          purpose: "Code generation, review, and refactoring. Best balance for the Coder/Reviewer loop on desktop." },
+        { id: "Qwen2.5-Coder-0.5B-Instruct-q4f16_1-MLC", vram: "~945 MB",
+          purpose: "Tiny code model. Fast, lower quality. Good for short snippets only." },
+        { id: "Qwen2.5-Coder-3B-Instruct-q4f16_1-MLC", vram: "~2.5 GB",
+          purpose: "Stronger code quality if your GPU has ~3 GB free. Slower first load. Desktop only." }
+      ],
+      "Ultra-lean general (mobile-friendly, under 1 GB)": [
+        { id: "SmolLM2-135M-Instruct-q0f16-MLC", vram: "~360 MB",
+          purpose: "Smallest functional LLM. Constrained-device demos only - limited reasoning." },
+        { id: "SmolLM2-360M-Instruct-q4f16_1-MLC", vram: "~376 MB",
+          purpose: "Best size/quality ratio under 500 MB. Best pick for iPhones and mid-range Android phones." },
+        { id: "TinyLlama-1.1B-Chat-v1.0-q4f16_1-MLC-1k", vram: "~675 MB",
+          purpose: "Very small chat model. 1024-token context. Older but reliable." },
+        { id: "Llama-3.2-1B-Instruct-q4f16_1-MLC", vram: "~879 MB",
+          purpose: "Higher quality general chat at ~1B params. 4k context. Works on most Android flagships." },
+        { id: "Qwen2.5-0.5B-Instruct-q4f16_1-MLC", vram: "~945 MB",
+          purpose: "Solid lean general-purpose chat. Multilingual." }
+      ],
+      "Lean general (1-2 GB VRAM)": [
+        { id: "Qwen3-0.6B-q4f16_1-MLC", vram: "~1.4 GB",
+          purpose: "Newer Qwen3 series. Supports thinking-mode toggle. Good lean default for general agents." },
+        { id: "Qwen2.5-1.5B-Instruct-q4f16_1-MLC", vram: "~1.6 GB",
+          purpose: "Better reasoning at 1.5B. Strong small agent model." },
+        { id: "SmolLM2-1.7B-Instruct-q4f16_1-MLC", vram: "~1.8 GB",
+          purpose: "Strongest sub-2GB general model. Slower load, better answers." },
+        { id: "gemma-2-2b-it-q4f16_1-MLC", vram: "~1.9 GB",
+          purpose: "Google's Gemma 2 2B. High-quality instruction tuning for mid-range edge devices." }
+      ],
+      "Mid-tier general (2-3 GB VRAM, desktop/flagship phones)": [
+        { id: "Llama-3.2-3B-Instruct-q4f16_1-MLC", vram: "~2.3 GB",
+          purpose: "Higher fidelity reasoning and data extraction within a mobile-friendly footprint." },
+        { id: "Phi-3.5-mini-instruct-q4f16_1-MLC-1k", vram: "~2.5 GB",
+          purpose: "Microsoft Phi-3.5 mini, 1024-token context. Strong small reasoning at lower VRAM." },
+        { id: "Phi-3.5-mini-instruct-q4f16_1-MLC", vram: "~3.7 GB",
+          purpose: "Phi-3.5 mini with full 4k context. Stronger answers, needs more VRAM. Desktop only." }
+      ],
+      "Math": [
+        { id: "Qwen2.5-Math-1.5B-Instruct-q4f16_1-MLC", vram: "~1.6 GB",
+          purpose: "Specialized for arithmetic, algebra, and step-by-step math reasoning." },
+        { id: "WizardMath-7B-V1.1-q4f16_1-MLC", vram: "~4.5 GB",
+          purpose: "Complex mathematical proofs and academic logic. Heavy - 7B model, needs decent GPU." }
+      ],
+      "Function calling / agentic tool use": [
+        { id: "Hermes-2-Pro-Mistral-7B-q4f16_1-MLC", vram: "~4.0 GB",
+          purpose: "WebLLM's official lean function-calling pick. Strict JSON schemas and tool routing." },
+        { id: "Hermes-2-Pro-Llama-3-8B-q4f16_1-MLC", vram: "~5.0 GB",
+          purpose: "Stronger function-calling model on Llama-3 base." },
+        { id: "Hermes-3-Llama-3.1-8B-q4f16_1-MLC", vram: "~4.9 GB",
+          purpose: "Latest Hermes. Best agentic / function-calling quality available in WebLLM." }
+      ],
+      "Reasoning (chain-of-thought)": [
+        { id: "DeepSeek-R1-Distill-Qwen-7B-q4f16_1-MLC", vram: "~5.1 GB",
+          purpose: "Distilled R1 reasoning. Strong at multi-step logical problem solving and coding." },
+        { id: "DeepSeek-R1-Distill-Llama-8B-q4f16_1-MLC", vram: "~5.0 GB",
+          purpose: "R1 reasoning on Llama-3 base. Comparable quality, different tokenizer." }
+      ],
+      "Language-specific": [
+        { id: "gemma-2-2b-jpn-it-q4f16_1-MLC", vram: "~1.9 GB",
+          purpose: "Gemma 2 fine-tuned for Japanese language and cultural context." }
+      ]
+    };
+
+    // ===== CLOUD PROVIDERS =====
+    // Note: all keys are stored only in sessionStorage (cleared when the tab closes).
+    // No key is ever written to disk or transmitted anywhere except directly to the provider's API.
+    // For Anthropic, we set anthropic-dangerous-direct-browser-access:true since this is a browser-only app.
+    const PROVIDERS = {
+      "local":      { name: "🖥️ Local (WebLLM, in-browser)",   needsKey: false, keyHint: "" },
+      "anthropic":  { name: "☁️ Anthropic (Claude)",            needsKey: true,  keyHint: "sk-ant-..." },
+      "openai":     { name: "☁️ OpenAI (GPT)",                  needsKey: true,  keyHint: "sk-..." },
+      "xai":        { name: "☁️ xAI (Grok)",                    needsKey: true,  keyHint: "xai-..." },
+      "google":     { name: "☁️ Google (Gemini)",               needsKey: true,  keyHint: "AIza..." },
+      "deepseek":   { name: "☁️ DeepSeek",                       needsKey: true,  keyHint: "sk-..." },
+      "perplexity": { name: "☁️ Perplexity (Sonar, web-grounded)", needsKey: true, keyHint: "pplx-..." }
+    };
+
+    const CLOUD_MODELS = {
+      "anthropic": {
+        "Frontier (best quality, highest cost)": [
+          { id: "claude-opus-4-7", vram: "Cloud",
+            purpose: "Most capable Claude. Best for complex code review, multi-step reasoning, long-horizon tasks. Apr 2026." },
+          { id: "claude-opus-4-6", vram: "Cloud",
+            purpose: "Previous Opus generation. Still excellent. Slightly cheaper than 4.7." }
+        ],
+        "Balanced (recommended default)": [
+          { id: "claude-sonnet-4-6", vram: "Cloud",
+            purpose: "Best speed/cost/quality balance. Recommended default for the Coder/Reviewer loop." }
+        ],
+        "Fast & cheap": [
+          { id: "claude-haiku-4-5-20251001", vram: "Cloud",
+            purpose: "Cheapest, fastest Claude. Short reviews and quick iterations." }
+        ]
+      },
+      "openai": {
+        "Frontier": [
+          { id: "gpt-5", vram: "Cloud",
+            purpose: "OpenAI's flagship. Top quality for complex coding and reasoning." }
+        ],
+        "Balanced": [
+          { id: "gpt-4o", vram: "Cloud",
+            purpose: "Mature OpenAI workhorse. Solid all-rounder, well-tested." }
+        ],
+        "Fast & cheap": [
+          { id: "gpt-4o-mini", vram: "Cloud",
+            purpose: "Cheap, fast OpenAI. Quick reviews where low cost matters." }
+        ]
+      },
+      "xai": {
+        "Frontier": [
+          { id: "grok-4", vram: "Cloud",
+            purpose: "xAI's flagship. Strong on coding and STEM. Real-time X data available." }
+        ],
+        "Fast reasoning": [
+          { id: "grok-4-fast-reasoning", vram: "Cloud",
+            purpose: "Optimized for fast multi-step reasoning. Long context." }
+        ],
+        "Non-reasoning fast": [
+          { id: "grok-4-fast-non-reasoning", vram: "Cloud",
+            purpose: "Direct answers without chain-of-thought. Cheapest Grok 4 variant." }
+        ]
+      },
+      "google": {
+        "Frontier": [
+          { id: "gemini-2.5-pro", vram: "Cloud",
+            purpose: "Google's flagship. 1M context. Excellent for very large code bases." }
+        ],
+        "Fast & cheap (recommended default)": [
+          { id: "gemini-2.5-flash", vram: "Cloud",
+            purpose: "Cheap, fast Gemini. Strong price/performance for most code review." }
+        ]
+      },
+      "deepseek": {
+        "General (V3)": [
+          { id: "deepseek-chat", vram: "Cloud",
+            purpose: "DeepSeek-V3. Frontier-grade code generation at very low cost." }
+        ],
+        "Reasoning (R1)": [
+          { id: "deepseek-reasoner", vram: "Cloud",
+            purpose: "DeepSeek-R1. Best for hard logical problems and complex debugging. Slower." }
+        ]
+      },
+      "perplexity": {
+        "Web-grounded answers": [
+          { id: "sonar-pro", vram: "Cloud",
+            purpose: "Perplexity Sonar Pro. Web-grounded with inline citations. Great for current docs/API lookup." },
+          { id: "sonar", vram: "Cloud",
+            purpose: "Base Sonar. Cheaper web-grounded queries." }
+        ],
+        "Reasoning + web": [
+          { id: "sonar-reasoning-pro", vram: "Cloud",
+            purpose: "Web-grounded chain-of-thought. Best for complex factual research." },
+          { id: "sonar-reasoning", vram: "Cloud",
+            purpose: "Cheaper reasoning + web variant." }
+        ]
+      }
+    };
+
+    const DEFAULTS_BY_PROVIDER = {
+      "local":      () => isMobile ? "SmolLM2-360M-Instruct-q4f16_1-MLC" : "Qwen2.5-Coder-1.5B-Instruct-q4f16_1-MLC",
+      "anthropic":  () => "claude-sonnet-4-6",
+      "openai":     () => "gpt-4o",
+      "xai":        () => "grok-4-fast-reasoning",
+      "google":     () => "gemini-2.5-flash",
+      "deepseek":   () => "deepseek-chat",
+      "perplexity": () => "sonar-pro"
+    };
+
+    const populateProviders = () => {
+      const sel = document.getElementById("providerSelect");
+      sel.innerHTML = "";
+      for (const [pid, p] of Object.entries(PROVIDERS)) {
+        const opt = document.createElement("option");
+        opt.value = pid;
+        opt.textContent = p.name;
+        sel.appendChild(opt);
+      }
+      sel.value = "local";
+      sel.addEventListener("change", onProviderChange);
+      onProviderChange();
+    };
+
+    const onProviderChange = () => {
+      const pid = document.getElementById("providerSelect").value;
+      activeProvider = pid;
+      populateModelsFor(pid);
+      const keyWrap = document.getElementById("apiKeyWrap");
+      const keyInput = document.getElementById("apiKeyInput");
+      if (PROVIDERS[pid].needsKey) {
+        keyWrap.classList.remove("hidden");
+        keyInput.placeholder = PROVIDERS[pid].keyHint;
+        keyInput.value = sessionStorage.getItem("apikey_" + pid) || "";
+      } else {
+        keyWrap.classList.add("hidden");
+      }
+      const btn = document.getElementById("initBtn");
+      if (btn) {
+        btn.innerText = (pid === "local")
+          ? "🚀 LOAD NEURAL ENGINE"
+          : `🔗 CONNECT TO ${PROVIDERS[pid].name.replace(/^☁️\s*/,'').toUpperCase()}`;
+      }
+    };
+
+    const populateModelsFor = (pid) => {
+      const sel = document.getElementById("modelSelect");
+      sel.innerHTML = "";
+      const catalog = (pid === "local") ? LEAN_MODELS : CLOUD_MODELS[pid];
+      for (const [group, items] of Object.entries(catalog)) {
+        const og = document.createElement("optgroup");
+        og.label = group;
+        for (const m of items) {
+          const opt = document.createElement("option");
+          opt.value = m.id;
+          opt.textContent = `${m.id}  (${m.vram})`;
+          opt.dataset.purpose = m.purpose;
+          opt.dataset.vram = m.vram;
+          og.appendChild(opt);
+        }
+        sel.appendChild(og);
+      }
+      sel.value = DEFAULTS_BY_PROVIDER[pid]();
+      refreshModelInfo();
+      // bind once
+      if (!sel.dataset.boundChange) {
+        sel.addEventListener("change", refreshModelInfo);
+        sel.dataset.boundChange = "1";
+      }
+    };
+
+    const refreshModelInfo = () => {
+      const sel = document.getElementById("modelSelect");
+      const opt = sel.options[sel.selectedIndex];
+      const info = document.getElementById("modelInfo");
+      info.innerHTML = "";
+      if (!opt) return;
+      const purposeRow = document.createElement("div");
+      purposeRow.innerHTML = `<b style="color:var(--neon-green);">Purpose: </b>`;
+      purposeRow.appendChild(document.createTextNode(opt.dataset.purpose || ""));
+      const vramRow = document.createElement("div");
+      vramRow.style.marginTop = "4px";
+      vramRow.innerHTML = `<b style="color:var(--neon-green);">${activeProvider === "local" ? "Approx VRAM" : "Runs on"}: </b>`;
+      vramRow.appendChild(document.createTextNode(opt.dataset.vram || "—"));
+      info.appendChild(purposeRow);
+      info.appendChild(vramRow);
+      if (isMobile && activeProvider === "local") {
+        const mob = document.createElement("div");
+        mob.style.marginTop = "6px";
+        mob.style.color = "var(--warn)";
+        mob.textContent = "📱 Mobile detected - default switched to a lean model. Models above 1 GB may fail or take 5+ min to download on phones.";
+        info.appendChild(mob);
+      }
+    };
+
+    populateProviders();
+
+    // ===== SESSION MODES =====
+    // The encrypted exchange is content-agnostic; only the role prompts, sentinel, and labels change per mode.
+    const MODES = {
+      "code-review": {
+        name: "💻 Code Review",
+        description: "Coder produces a code artifact; Reviewer checks for bugs/clarity. Converges on STATUS: ERROR_FREE.",
+        roleA_label: "Coder",       roleA_emoji: "🖊️",
+        roleB_label: "Reviewer",    roleB_emoji: "🔍",
+        taskNoun: "code task",
+        taskPlaceholder: "Describe the code task (e.g. 'write a function to merge two sorted arrays in O(n)')...",
+        systemA: "You are the AUTHOR. Produce the requested code artifact only. Be concise. No preamble, no commentary. Address reviewer feedback by revising the artifact.",
+        systemB: "You are a strict but concise code reviewer. Find only major bugs, correctness issues, and clarity problems. Keep review under 250 words. The FINAL LINE of your response must be exactly one of:\nSTATUS: ERROR_FREE\nSTATUS: NEEDS_FIXES",
+        approvalRegex: /STATUS\s*[:\-]\s*(ERROR[_\-\s]?FREE|APPROVED|LGTM)\b/i,
+        maxIterations: 6,
+        authorMaxTokens: 900, reviewerMaxTokens: 420,
+        clipAuthorReview: 2500, clipReviewerArtifact: 12000
+      },
+      "idea-critique": {
+        name: "💡 Idea Critique",
+        description: "Proposer pitches an idea; Critic stress-tests it. Converges on STATUS: REFINED.",
+        roleA_label: "Proposer",    roleA_emoji: "💡",
+        roleB_label: "Critic",      roleB_emoji: "🔥",
+        taskNoun: "idea",
+        taskPlaceholder: "Describe the idea to stress-test (e.g. 'launch a P2P inference marketplace on Algorand')...",
+        systemA: "You are the PROPOSER refining a concrete proposal. Output a clear, specific proposal addressing objectives, constraints, and any critic feedback. Be specific, not aspirational. No filler. Under 400 words.",
+        systemB: "You are a sharp, fair-minded critic. Identify the weakest assumption, missing constraint, hidden risk, or unstated dependency. Be specific and brief, under 250 words. The FINAL LINE of your response must be exactly one of:\nSTATUS: REFINED\nSTATUS: NEEDS_WORK",
+        approvalRegex: /STATUS\s*[:\-]\s*(REFINED|SOLID|APPROVED)\b/i,
+        maxIterations: 6,
+        authorMaxTokens: 700, reviewerMaxTokens: 500,
+        clipAuthorReview: 2500, clipReviewerArtifact: 8000
+      },
+      "roadmap": {
+        name: "🗺️ Roadmap Building",
+        description: "Strategist drafts a phased roadmap; Reality-Checker tests sequencing/feasibility. Converges on STATUS: VIABLE.",
+        roleA_label: "Strategist",       roleA_emoji: "🗺️",
+        roleB_label: "Reality-Checker",  roleB_emoji: "⚙️",
+        taskNoun: "goal",
+        taskPlaceholder: "Goal or product to roadmap (e.g. 'ship a working A2A framework in 3 months')...",
+        systemA: "You are a STRATEGIST producing a phased roadmap. Output numbered phases, each with concrete deliverables, dependencies, success criteria, and rough timing. No vague aspirations. Revise based on reality-checker feedback.",
+        systemB: "You are a reality-checker. Stress-test the roadmap for: sequencing errors, hidden dependencies, infeasible phase scope, missing prerequisites, unrealistic timing. Under 250 words. The FINAL LINE must be exactly one of:\nSTATUS: VIABLE\nSTATUS: NEEDS_REVISION",
+        approvalRegex: /STATUS\s*[:\-]\s*(VIABLE|FEASIBLE|APPROVED)\b/i,
+        maxIterations: 6,
+        authorMaxTokens: 900, reviewerMaxTokens: 500,
+        clipAuthorReview: 2500, clipReviewerArtifact: 8000
+      },
+      "planning": {
+        name: "📋 Action Planning",
+        description: "Planner produces a concrete action plan; Auditor checks for gaps. Converges on STATUS: APPROVED.",
+        roleA_label: "Planner",    roleA_emoji: "📋",
+        roleB_label: "Auditor",    roleB_emoji: "🧐",
+        taskNoun: "what to plan",
+        taskPlaceholder: "What to plan (e.g. 'rollout of branch automation across 12 SOLs in Q3')...",
+        systemA: "You are a PLANNER producing a tight action plan. Output numbered steps, each with owner (role), trigger/precondition, success metric, rough timing. Revise based on auditor feedback.",
+        systemB: "You are an auditor. Check the plan for: missing steps, unclear dependencies, weak success metrics, unrealistic timing, single points of failure. Under 250 words. The FINAL LINE must be exactly one of:\nSTATUS: APPROVED\nSTATUS: NEEDS_FIXES",
+        approvalRegex: /STATUS\s*[:\-]\s*(APPROVED|READY|GO)\b/i,
+        maxIterations: 6,
+        authorMaxTokens: 900, reviewerMaxTokens: 500,
+        clipAuthorReview: 2500, clipReviewerArtifact: 8000
+      },
+      "reasoning": {
+        name: "🧠 Best Reasoning (Dialectic)",
+        description: "Thinker argues a claim; Skeptic counters. Converges on STATUS: CONCLUDED.",
+        roleA_label: "Thinker",    roleA_emoji: "🧠",
+        roleB_label: "Skeptic",    roleB_emoji: "🌀",
+        taskNoun: "question",
+        taskPlaceholder: "Question or claim to reason about (e.g. 'should we route around the CoordiPay facilitator for full A2A?')...",
+        systemA: "You are the THINKER. Produce a rigorous argument: explicit premises, valid inferences, clear conclusion. Address skeptic counter-arguments by strengthening, qualifying, or revising the argument. Under 500 words.",
+        systemB: "You are the SKEPTIC. Find the weakest premise, the strongest counter-argument, or a genuine alternative view. Be specific and brief, under 300 words. The FINAL LINE must be exactly one of:\nSTATUS: CONCLUDED\nSTATUS: WEAK",
+        approvalRegex: /STATUS\s*[:\-]\s*(CONCLUDED|SOUND|ROBUST)\b/i,
+        maxIterations: 8,
+        authorMaxTokens: 900, reviewerMaxTokens: 600,
+        clipAuthorReview: 3000, clipReviewerArtifact: 8000
+      },
+      "custom": {
+        name: "⚙️ Custom (default sentinel: STATUS: DONE)",
+        description: "Generic author/critic pattern. The artifact is whatever you describe in the task box. Converges on STATUS: DONE.",
+        roleA_label: "Author",     roleA_emoji: "✍️",
+        roleB_label: "Critic",     roleB_emoji: "🔍",
+        taskNoun: "task",
+        taskPlaceholder: "Describe the task and the type of artifact you want produced...",
+        systemA: "You are the AUTHOR. Produce the requested artifact only. Revise based on critic feedback. Be concise. No preamble.",
+        systemB: "You are the CRITIC. Identify the most important problem with the artifact. Under 250 words. The FINAL LINE must be exactly one of:\nSTATUS: DONE\nSTATUS: REVISE",
+        approvalRegex: /STATUS\s*[:\-]\s*(DONE|APPROVED|FINAL)\b/i,
+        maxIterations: 6,
+        authorMaxTokens: 900, reviewerMaxTokens: 500,
+        clipAuthorReview: 2500, clipReviewerArtifact: 8000
+      },
+      "marketplace": {
+        name: "💼 AI Agent Marketplace",
+        description: "Switches the app into Marketplace mode: publish agent offers, browse, hire providers via USM processes, encrypted delivery, Settlement, ratings. Skips the Coder/Reviewer role pick.",
+        // Marketplace mode does not use a paired-agent loop, so these fields are placeholders:
+        roleA_label: "Provider",   roleA_emoji: "🏪",
+        roleB_label: "Buyer",      roleB_emoji: "🛒",
+        taskNoun: "marketplace action",
+        taskPlaceholder: "(not used in marketplace mode)",
+        systemA: "(not used)", systemB: "(not used)",
+        approvalRegex: /STATUS\s*[:\-]\s*APPROVED/i,
+        maxIterations: 0,
+        authorMaxTokens: 0, reviewerMaxTokens: 0,
+        clipAuthorReview: 0, clipReviewerArtifact: 0,
+        isMarketplace: true
+      }
+    };
+
+    let ACTIVE_MODE = MODES["code-review"];
+    window.ACTIVE_MODE = ACTIVE_MODE; // cross-script-scope handle for the plain <script> block below
+
+    const populateModes = () => {
+      const sel = document.getElementById("modeSelect");
+      sel.innerHTML = "";
+      for (const [id, m] of Object.entries(MODES)) {
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = m.name;
+        opt.dataset.description = m.description;
+        sel.appendChild(opt);
+      }
+      sel.value = "code-review";
+      refreshModeInfo();
+      sel.addEventListener("change", refreshModeInfo);
+    };
+
+    const refreshModeInfo = () => {
+      const sel = document.getElementById("modeSelect");
+      const opt = sel.options[sel.selectedIndex];
+      const info = document.getElementById("modeInfo");
+      info.innerHTML = "";
+      if (!opt) return;
+      const row = document.createElement("div");
+      row.appendChild(document.createTextNode(opt.dataset.description || ""));
+      info.appendChild(row);
+      const sentinel = document.createElement("div");
+      sentinel.style.marginTop = "6px";
+      sentinel.style.color = "var(--neon-green)";
+      sentinel.appendChild(document.createTextNode(`Max iterations: ${MODES[sel.value].maxIterations}`));
+      info.appendChild(sentinel);
+    };
+
+    window.continueFromMode = () => {
+      const modeId = document.getElementById("modeSelect").value;
+      ACTIVE_MODE = MODES[modeId];
+      window.ACTIVE_MODE = ACTIVE_MODE;
+      // Retitle and relabel the rest of the UI based on the chosen mode
+      const setText = (sel, t) => { const e = document.querySelector(sel); if (e) e.innerText = t; };
+      const setPlaceholder = (id, p) => { const e = document.getElementById(id); if (e) e.placeholder = p; };
+      setText("#roleView h3", `3. Select Role for ${ACTIVE_MODE.name}`);
+      const btnA = document.getElementById("roleAButton");
+      const btnB = document.getElementById("roleBButton");
+      if (btnA) btnA.innerText = `${ACTIVE_MODE.roleA_emoji} ${ACTIVE_MODE.roleA_label.toUpperCase()}`;
+      if (btnB) btnB.innerText = `${ACTIVE_MODE.roleB_emoji} ${ACTIVE_MODE.roleB_label.toUpperCase()}`;
+      setText("#coderInterface h3", `${ACTIVE_MODE.roleA_emoji} ${ACTIVE_MODE.roleA_label} Terminal`);
+      setPlaceholder("codeTask", ACTIVE_MODE.taskPlaceholder);
+      setPlaceholder("reviewerAddress", `${ACTIVE_MODE.roleB_label}'s Algorand address`);
+      setPlaceholder("coderOutput", `${ACTIVE_MODE.roleA_label} output will appear here...`);
+      setText("#reviewerInterface h3", `${ACTIVE_MODE.roleB_emoji} ${ACTIVE_MODE.roleB_label} Terminal`);
+      setPlaceholder("coderAddress", `${ACTIVE_MODE.roleA_label}'s Algorand address only; process is auto-discovered`);
+      setPlaceholder("reviewerOutput", `${ACTIVE_MODE.roleB_label} output will appear here...`);
+      window.logToUI(`<span class='ok'>🎯 Mode locked: ${window.escapeHTML(ACTIVE_MODE.name)} (sentinel = ${ACTIVE_MODE.approvalRegex}, max iterations = ${ACTIVE_MODE.maxIterations})</span>`);
+      document.getElementById("modeView").classList.add("hidden");
+      if (ACTIVE_MODE.isMarketplace) {
+        document.getElementById("marketplaceView").classList.remove("hidden");
+      } else {
+        document.getElementById("roleView").classList.remove("hidden");
+      }
+    };
+
+    populateModes();
+
+    window.startLoadingAI = async () => {
+      const modelId = document.getElementById("modelSelect").value;
+      activeModel = modelId;
+      const btn = document.getElementById("initBtn");
+      const bar = document.getElementById("progress-fill");
+      const val = document.getElementById("load-val");
+
+      // === Cloud provider path: no download, just validate key and proceed ===
+      if (activeProvider !== "local") {
+        const key = (document.getElementById("apiKeyInput").value || "").trim();
+        if (!key) {
+          window.logToUI(`<span class='err'>❌ API key required for ${PROVIDERS[activeProvider].name}.</span>`);
+          return;
+        }
+        sessionStorage.setItem("apikey_" + activeProvider, key);
+        btn.disabled = true;
+        btn.innerText = "CONNECTED";
+        bar.style.width = "100%";
+        val.innerText = "API";
+        window._llmReady = true; // expose readiness to plain-script marketplace handlers
+        window.logToUI(`<span class='ok'>✅ Connected to ${PROVIDERS[activeProvider].name} (${modelId}). Key held only in this tab's session.</span>`);
+        document.getElementById("active-model").innerText = activeProvider + ":" + modelId.split("-").slice(0,2).join("-");
+        document.getElementById("setupView").classList.add("hidden");
+        if (window._labModeRequested) {
+          document.getElementById("modeView").classList.remove("hidden");
+        } else {
+          ACTIVE_MODE = MODES["marketplace"];
+          window.ACTIVE_MODE = ACTIVE_MODE;
+          document.getElementById("marketplaceView").classList.remove("hidden");
+          if (window._showTopTabsAndActivate) window._showTopTabsAndActivate("marketplace");
+        }
+        return;
+      }
+
+      // === Local WebLLM path (unchanged) ===
+      btn.disabled = true;
+      btn.innerText = "INITIALIZING...";
+
+      if (!navigator.gpu) {
+          window.logToUI("<span class='err'>❌ ERROR: WebGPU not supported. Use Chrome and enable WebGPU if needed.</span>");
+          btn.disabled = false;
+          btn.innerText = "RETRY";
+          return;
+      }
+
+      try {
+        engine = await webllm.CreateMLCEngine(modelId, {
+          initProgressCallback: (p) => {
+            const pVal = Math.round((p.progress || 0) * 100);
+            bar.style.width = `${pVal}%`;
+            val.innerText = `${pVal}%`;
+            if (p.text) window.logToUI(`<span>🧠 Loading: ${window.escapeHTML(p.text)}</span>`);
+          }
+        });
+
+        window.logToUI("<span class='ok'>✅ Brain Active.</span>");
+        window._llmReady = true; // expose readiness to plain-script marketplace handlers
+        document.getElementById("active-model").innerText = modelId.split('-')[0];
+        document.getElementById("setupView").classList.add("hidden");
+        if (window._labModeRequested) {
+          document.getElementById("modeView").classList.remove("hidden");
+        } else {
+          ACTIVE_MODE = MODES["marketplace"];
+          window.ACTIVE_MODE = ACTIVE_MODE;
+          document.getElementById("marketplaceView").classList.remove("hidden");
+          if (window._showTopTabsAndActivate) window._showTopTabsAndActivate("marketplace");
+        }
+      } catch (e) {
+        window.logToUI(`<span class='err'>❌ DOWNLOAD/INIT FAILED: ${window.escapeHTML(e.message)}</span>`);
+        console.error(e);
+        btn.disabled = false;
+        btn.innerText = "RETRY DOWNLOAD";
+      }
+    };
+
+    window.callLocalAI = async (sys, user, options = {}) => {
+        // === Cloud route ===
+        if (activeProvider !== "local") {
+          return await callCloudAI(activeProvider, activeModel, sys, user, options);
+        }
+
+        // === Local WebLLM route (original) ===
+        if (!engine) throw new Error("AI engine is not loaded yet");
+
+        const timeoutMs = options.timeoutMs || 180000;
+        const maxTokens = options.maxTokens || 512;
+        const label = options.label || "Local AI";
+        const started = Date.now();
+        let completed = false;
+
+        const heartbeat = setInterval(() => {
+          if (!completed) {
+            const secs = Math.floor((Date.now() - started) / 1000);
+            window.logToUI(`<span class='warn'>⏳ ${window.escapeHTML(label)} still thinking... ${secs}s</span>`);
+          }
+        }, 15000);
+
+        const generation = engine.chat.completions.create({
+            messages: [{role: "system", content: sys}, {role: "user", content: user}],
+            temperature: options.temperature ?? 0.15,
+            max_tokens: maxTokens
+        });
+
+        const timeout = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(timeoutMs/1000)} seconds. Try the smaller Qwen model, reduce the prompt/code size, or wipe cache and reload.`)), timeoutMs);
+        });
+
+        try {
+          const r = await Promise.race([generation, timeout]);
+          completed = true;
+          return r.choices?.[0]?.message?.content || "";
+        } finally {
+          completed = true;
+          clearInterval(heartbeat);
+        }
+    };
+
+    // ===== Cloud AI dispatch =====
+    async function callCloudAI(provider, model, sys, user, options) {
+      const key = sessionStorage.getItem("apikey_" + provider);
+      if (!key) throw new Error(`No API key for ${provider}. Reconnect from setup.`);
+      const maxTokens   = options.maxTokens   || 512;
+      const temperature = options.temperature ?? 0.15;
+      const timeoutMs   = options.timeoutMs   || 180000;
+      const label       = options.label       || "Cloud AI";
+
+      const started = Date.now();
+      let completed = false;
+      const heartbeat = setInterval(() => {
+        if (!completed) {
+          const secs = Math.floor((Date.now() - started) / 1000);
+          window.logToUI(`<span class='warn'>⏳ ${window.escapeHTML(label)} (${provider}) still thinking... ${secs}s</span>`);
+        }
+      }, 15000);
+
+      const timeoutP = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`${label} (${provider}) timed out after ${Math.round(timeoutMs/1000)}s.`)), timeoutMs);
+      });
+
+      try {
+        let work;
+        if (provider === "anthropic")      work = callAnthropic(key, model, sys, user, maxTokens, temperature);
+        else if (provider === "google")    work = callGemini(key, model, sys, user, maxTokens, temperature);
+        else                                work = callOpenAICompat(provider, key, model, sys, user, maxTokens, temperature);
+        const result = await Promise.race([work, timeoutP]);
+        completed = true;
+        return result;
+      } finally {
+        completed = true;
+        clearInterval(heartbeat);
+      }
+    }
+
+    async function callAnthropic(key, model, sys, user, maxTokens, temperature) {
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": key,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true"
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: maxTokens,
+          temperature,
+          system: sys,
+          messages: [{role: "user", content: user}]
+        })
+      });
+      if (!r.ok) {
+        const errText = (await r.text()).slice(0, 300);
+        throw new Error(`Anthropic ${r.status}: ${errText}`);
+      }
+      const data = await r.json();
+      return (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+    }
+
+    async function callGemini(key, model, sys, user, maxTokens, temperature) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: user }] }],
+          systemInstruction: { parts: [{ text: sys }] },
+          generationConfig: { temperature, maxOutputTokens: maxTokens }
+        })
+      });
+      if (!r.ok) {
+        const errText = (await r.text()).slice(0, 300);
+        throw new Error(`Google ${r.status}: ${errText}`);
+      }
+      const data = await r.json();
+      return (data.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("");
+    }
+
+    async function callOpenAICompat(provider, key, model, sys, user, maxTokens, temperature) {
+      const ENDPOINTS = {
+        "openai":     "https://api.openai.com/v1/chat/completions",
+        "xai":        "https://api.x.ai/v1/chat/completions",
+        "deepseek":   "https://api.deepseek.com/v1/chat/completions",
+        "perplexity": "https://api.perplexity.ai/chat/completions"
+      };
+      const url = ENDPOINTS[provider];
+      if (!url) throw new Error(`Unknown OpenAI-compatible provider: ${provider}`);
+      const r = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + key
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+          temperature,
+          max_tokens: maxTokens
+        })
+      });
+      if (!r.ok) {
+        const errText = (await r.text()).slice(0, 300);
+        throw new Error(`${provider} ${r.status}: ${errText}`);
+      }
+      const data = await r.json();
+      return data.choices?.[0]?.message?.content || "";
+    }
+
+    // Hard ceiling so the encrypted envelope fits in Algorand's 2048-byte ApplicationArgs budget.
+    // 280 tokens ≈ 1100 chars in prose, ~840 chars in code (denser tokenization).
+    // Both stay safely under clipForOnChain's 1300-char cap.
+    const ONCHAIN_MAX_TOKENS = 280;
+    const BREVITY_REMINDER_AUTHOR = "\n\nMANDATORY BREVITY: Your response MUST be under 180 words AND under 1100 characters total. If your draft exceeds this, condense it before responding. Do not apologize for brevity; just stay within the limit.";
+    const BREVITY_REMINDER_REVIEWER = "\n\nMANDATORY BREVITY: Your response MUST be under 140 words AND under 900 characters total, INCLUDING the final STATUS line. Be terse. Identify only the single most important issue, not every issue.";
+
+    window.callGrokAPI = async (reviewText) => {
+        const task = localStorage.getItem("codeTask") || "";
+        const clippedReview = String(reviewText || "").slice(0, ACTIVE_MODE.clipAuthorReview);
+        const taskNounCap = ACTIVE_MODE.taskNoun.charAt(0).toUpperCase() + ACTIVE_MODE.taskNoun.slice(1);
+        const prompt = reviewText
+          ? `Original ${ACTIVE_MODE.taskNoun}: ${task}\n\nFeedback from ${ACTIVE_MODE.roleB_label}:\n${clippedReview}\n\nRevise the artifact accordingly. Output only the revised artifact, no preamble.`
+          : `${taskNounCap}: ${task}\n\nOutput only the artifact, no preamble.`;
+        return await window.callLocalAI(
+          ACTIVE_MODE.systemA + BREVITY_REMINDER_AUTHOR,
+          prompt,
+          { label: ACTIVE_MODE.roleA_label, maxTokens: Math.min(ACTIVE_MODE.authorMaxTokens, ONCHAIN_MAX_TOKENS), timeoutMs: 180000 }
+        );
+    };
+
+    window.callOpenAIAPI = async (artifact) => {
+        const clipped = String(artifact || "").slice(0, ACTIVE_MODE.clipReviewerArtifact);
+        if (String(artifact || "").length > clipped.length) {
+          window.logToUI(`<span class='warn'>⚠️ Artifact is large; ${ACTIVE_MODE.roleB_label.toLowerCase()} prompt clipped to ${clipped.length} chars for model stability.</span>`);
+        }
+        return await window.callLocalAI(
+          ACTIVE_MODE.systemB + BREVITY_REMINDER_REVIEWER,
+          `Review the following ${ACTIVE_MODE.taskNoun}:\n\n${clipped}`,
+          { label: ACTIVE_MODE.roleB_label, maxTokens: Math.min(ACTIVE_MODE.reviewerMaxTokens, ONCHAIN_MAX_TOKENS), timeoutMs: 180000 }
+        );
+    };
+
+    window.wipeCache = async () => {
+        const dbs = await window.indexedDB.databases();
+        dbs.forEach(db => window.indexedDB.deleteDatabase(db.name));
+        alert("Cache wiped. Refreshing...");
+        location.reload();
+    };
+  </script>
+
+  <script>
+    window.escapeHTML = function(str) {
+      return String(str).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    };
+
+    window.logToUI = function(m) {
+      const l = document.getElementById("log");
+      if (!l) return console.log(m);
+      l.innerHTML += m + "<br>";
+      l.scrollTop = l.scrollHeight;
+    };
+
+    window.sleep = function(ms) { return new Promise(r => setTimeout(r, ms)); };
+
+    function showTools() {
+      const tools = document.getElementById("sessionTools");
+      if (!tools) return;
+      // Remove the legacy "hidden" class so the panel CAN be shown.
+      tools.classList.remove("hidden");
+      // But respect the top-tab system: only set display:block if we're on the session tab.
+      // Otherwise force display:none so it stays hidden until the user switches to the tab.
+      if (window._activeTopTab === undefined) return; // tab system not initialized yet — fall through
+      const onSession = (document.querySelector('.top-tab.active') || {}).getAttribute &&
+                        document.querySelector('.top-tab.active').getAttribute('data-tab') === 'session';
+      tools.style.display = onSession ? '' : 'none';
+    }
+
+    function renderHistory() {
+      const box = document.getElementById("historyBox");
+      if (!box) return;
+      if (!sessionHistory.length) {
+        box.textContent = "No session history yet.";
+        return;
+      }
+      box.textContent = sessionHistory.map((h, i) => {
+        const stamp = new Date(h.time).toLocaleString();
+        return `#${i + 1} [${stamp}] ${h.role} / ${h.kind}\n${h.text}`;
+      }).join("\n\n---\n\n");
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function addHistory(role, kind, text) {
+      sessionHistory.push({ time: Date.now(), role, kind, text: String(text || "") });
+      renderHistory();
+    }
+
+    function downloadBlob(filename, content) {
+      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function guessExtension(code) {
+      const c = String(code || "").toLowerCase();
+      if (/\bdef\s+|\bimport\s+|\bclass\s+/.test(c)) return ".py";
+      if (/\bfunction\s+|\bconst\s+|\blet\s+|=>/.test(c)) return ".js";
+      if (/public\s+class|private\s+|system\.out/.test(c)) return ".java";
+      if (/#include|int\s+main\s*\(/.test(c)) return ".cpp";
+      if (/\bpackage\s+main\b|\bfunc\s+/.test(c)) return ".go";
+      if (/\bfn\s+|\bimpl\s+/.test(c)) return ".rs";
+      if (/^\s*<(!doctype|html|script|style)/i.test(code || "")) return ".html";
+      return ".txt";
+    }
+
+    window.downloadFinalCode = function() {
+      const code = finalApprovedCode || window.finalApprovedCode || lastGeneratedCode || window.lastGeneratedCode || "";
+      if (!code) {
+        window.logToUI("<span class='err'>❌ No final/generated code is available to download yet.</span>");
+        return;
+      }
+      const ext = guessExtension(code);
+      downloadBlob(`coordichain_final_code_${Date.now()}${ext}`, code);
+      window.logToUI(`<span class='ok'>✅ Final/generated code downloaded as ${ext}</span>`);
+    };
+
+    window.downloadHistory = function() {
+      if (!sessionHistory.length) {
+        window.logToUI("<span class='err'>❌ No history available to download yet.</span>");
+        return;
+      }
+      const text = sessionHistory.map((h, i) => {
+        return `#${i + 1}\nTime: ${new Date(h.time).toISOString()}\nRole: ${h.role}\nKind: ${h.kind}\n\n${h.text}`;
+      }).join("\n\n==============================\n\n");
+      downloadBlob(`coordichain_history_${Date.now()}.txt`, text);
+      window.logToUI("<span class='ok'>✅ History downloaded.</span>");
+    };
+
+    window.deleteAllAIBoxes = async function() {
+      try {
+        if (typeof window.deleteEntity !== "function") {
+          throw new Error("Delete functions are not available.");
+        }
+        if (!myAccount) {
+          throw new Error("Unlock your account first (BE A PROVIDER tab → UNLOCK, or click ASK on any offer).");
+        }
+        const pid = processId || window.lastProcessId;
+        const ids = new Set(trackedEntityIds);
+        // Legacy code-review lab cleanup: only if a process is active
+        if (pid) {
+          ids.add(`${pid}_task`);
+          for (let turn = 0; turn <= 60; turn++) {
+            ids.add(`${pid}_code_${turn}`);
+            ids.add(`${pid}_review_${turn}`);
+          }
+        }
+        if (ids.size === 0) {
+          window.logToUI("<span class='hint'>Nothing to delete — no entities tracked in this session.</span>");
+          return;
+        }
+        window.logToUI(`<span class='warn'>🗑️ Cleanup started: deleting ${ids.size} tracked entity(ies) you own...</span>`);
+        isRunning = false;
+        let deleted = 0;
+        let skipped = 0;
+        for (const id of ids) {
+          try {
+            await window.deleteEntity(id);
+            trackedEntityIds.delete(id);
+            deleted++;
+            window.logToUI(`✅ Deleted entity: <span class='mono'>${window.escapeHTML(id)}</span> · MBR refunded`);
+            await window.sleep(100);
+          } catch (e) {
+            skipped++;
+            // Most common skip reasons: box doesn't exist, or you don't own it (USM owner-only assert)
+          }
+        }
+        // Optional process cleanup, only if processId was set
+        if (pid && typeof window.deleteProcess === "function") {
+          try {
+            if (typeof window.resignProcess === "function") {
+              try { await window.resignProcess(pid); } catch (_) {}
+            }
+            await window.deleteProcess(pid);
+            deleted++;
+            window.logToUI(`✅ Deleted process: <span class='mono'>${window.escapeHTML(pid)}</span>`);
+          } catch (e) {
+            skipped++;
+            window.logToUI(`<span class='warn'>⚠️ Process delete skipped/failed: ${window.escapeHTML(e.message)}</span>`);
+          }
+        }
+        window.logToUI(`<span class='ok'>✅ Cleanup finished. Deleted ${deleted}; skipped ${skipped} (missing or not owned by you).</span>`);
+      } catch (e) {
+        window.logToUI(`<span class='err'>❌ Cleanup failed: ${window.escapeHTML(e.message)}</span>`);
+        console.error(e);
+      }
+    };
+
+    let userRole = null;
+    let processId = null;
+    let myAccount = null;
+    let recipientAddress = null;
+    let isRunning = false;
+    let isApproved = false;
+    let lastHandledTurn = -1;
+    let finalApprovedCode = "";
+    let lastGeneratedCode = "";
+    let sessionHistory = [];
+    const trackedEntityIds = new Set();
+
+    window.selectRole = function(r) {
+        userRole = r;
+        document.getElementById("roleView").classList.add("hidden");
+        document.getElementById(r + "Interface").classList.remove("hidden");
+        showTools();
+        window.logToUI(`✅ Role Selected: ${r.toUpperCase()}`);
+    };
+
+    function requireDeps() {
+      const needed = ["algosdk", "nacl", "ed2curve"];
+      for (const n of needed) { if (!window[n]) throw new Error(`${n} CDN not loaded`); }
+      for (const fn of ["createProcess", "createEntity", "readProcess", "readEntity", "advanceProcess"]) {
+        if (typeof window[fn] !== "function") throw new Error(`${fn}() is not available. Embedded contract code did not initialize.`);
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CoordiPay — HTTP 402 Payment Gate, serverless
+    // ═══════════════════════════════════════════════════════════════════════════
+    // The npm packages CoordiPay, @CoordiPay/avm, @CoordiPay/fetch are convenience
+    // wrappers around the CoordiPay *protocol*. The protocol itself is:
+    //
+    //   1. Resource server returns HTTP 402 + a JSON challenge with payment requirements
+    //      (network, asset, amount, receiver, resource, nonce, expiry).
+    //   2. Client signs and submits an Algorand payment txn whose `note` field binds
+    //      the payment to the resource and nonce (anti-replay, anti-substitution).
+    //   3. Resource server pulls the confirmed txn from algod, validates type/receiver/
+    //      amount/note, and grants access.
+    //
+    // No npm. No backend. Same algodClient and mnemonic the rest of CoordiChain uses.
+    window.coordiPay = {
+      request({ priceMicroAlgos, receiver, resource, network = "algorand-testnet" }) {
+        const nonce = (crypto.randomUUID && crypto.randomUUID()) || (Date.now() + "-" + Math.random().toString(36).slice(2));
+        const expires = Date.now() + 5 * 60 * 1000;
+        return {
+          status: 402,
+          headers: {
+            "X-Payment-Required":            "true",
+            "X-Payment-Scheme":              "ExactAvmScheme",
+            "X-Payment-Network":             network,
+            "X-Payment-Asset":               "ALGO",
+            "X-Payment-Amount-MicroAlgos":   String(priceMicroAlgos),
+            "X-Payment-Receiver":            receiver,
+            "X-Payment-Resource":            resource,
+            "X-Payment-Nonce":               nonce,
+            "X-Payment-Expires":             String(expires)
+          },
+          body: {
+            scheme:           "ExactAvmScheme",
+            network,
+            asset:            "ALGO",
+            amountMicroAlgos: priceMicroAlgos,
+            receiver,
+            resource,
+            nonce,
+            expires,
+            message:          `Pay ${(priceMicroAlgos / 1e6).toFixed(6)} ALGO to ${receiver} to access "${resource}"`
+          }
+        };
+      },
+
+      async pay(challenge, senderAccount) {
+        const { amountMicroAlgos, receiver, resource, nonce, expires } = challenge.body;
+        if (Date.now() > expires) throw new Error("Payment request expired - get a fresh challenge");
+        const sp = await algodClient.getTransactionParams().do();
+        const notePayload = { coordiPay: "v1", scheme: "ExactAvmScheme", resource, nonce };
+        const note = new TextEncoder().encode(JSON.stringify(notePayload));
+        const txn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+          from:               accountAddress(senderAccount),
+          to:                 receiver,
+          amount:             amountMicroAlgos,
+          suggestedParams:    sp,
+          note
+        });
+        const signed = txn.signTxn(senderAccount.sk);
+        const { txId } = await algodClient.sendRawTransaction(signed).do();
+        await algosdk.waitForConfirmation(algodClient, txId, 6);
+        return {
+          "paymentTxId":      txId,
+          "X-Payment-Resource":   resource,
+          "X-Payment-Nonce":      nonce,
+          "X-Payment-Sender":     accountAddress(senderAccount),
+          "X-Payment-Scheme":     "ExactAvmScheme"
+        };
+      },
+
+      async verify(proof, { expectedReceiver, expectedAmount, expectedResource, expectedNonce }) {
+        // Accept new (paymentTxId) and legacy (X-Payment-Proof / x402Proof) field names
+        const txId = proof && (proof["paymentTxId"] || proof["X-Payment-Proof"] || proof["x402Proof"]);
+        if (!txId) return { valid: false, reason: "no proof tx id" };
+        let info;
+        try {
+          info = await algodClient.pendingTransactionInformation(txId).do();
+        } catch (e) {
+          return { valid: false, reason: `algod lookup failed: ${e.message}` };
+        }
+        if (!info || typeof info["confirmed-round"] !== "number" || info["confirmed-round"] <= 0) {
+          return { valid: false, reason: "txn not yet confirmed or not found in pending pool" };
+        }
+        const txn = info.txn.txn;
+        if (txn.type !== "pay") return { valid: false, reason: `wrong type: ${txn.type} (expected pay)` };
+        const rcv = algosdk.encodeAddress(txn.rcv);
+        if (rcv !== expectedReceiver) return { valid: false, reason: `wrong receiver: ${rcv} vs ${expectedReceiver}` };
+        if (Number(txn.amt || 0) < Number(expectedAmount)) {
+          return { valid: false, reason: `underpaid: ${txn.amt || 0} < ${expectedAmount}` };
+        }
+        if (txn.note) {
+          try {
+            const note = JSON.parse(new TextDecoder().decode(txn.note));
+            // Accept both protocol tags during the rename transition
+            const versionTag = note.coordiPay || note.x402;
+            if (versionTag !== "v1") return { valid: false, reason: `bad CoordiPay version: ${versionTag}` };
+            if (note.resource !== expectedResource) {
+              return { valid: false, reason: `resource mismatch: "${note.resource}" vs "${expectedResource}"` };
+            }
+            if (expectedNonce && note.nonce !== expectedNonce) {
+              return { valid: false, reason: `nonce mismatch (possible replay)` };
+            }
+          } catch (e) {
+            return { valid: false, reason: "note not parseable as CoordiPay JSON" };
+          }
+        } else {
+          return { valid: false, reason: "no note - cannot bind payment to resource/nonce" };
+        }
+        return {
+          valid:  true,
+          txId,
+          round:  info["confirmed-round"],
+          sender: algosdk.encodeAddress(txn.snd),
+          amount: Number(txn.amt)
+        };
+      }
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // end CoordiPay
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MARKETPLACE — AI Agent Marketplace on USM (v10: Quick Ask + auto-respond)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Entity schemas (all under 64-byte box-key limit):
+    //   agent:<addr16>                   → agent profile (+ lastHeartbeat)
+    //   offer:<addr16>:<offerId>         → offer JSON
+    //   offers:index                     → discovery index { offerKeys: [...] }
+    //   inbox:<provAddr16>               → provider's inbox { pending, processed }
+    //   job:<jobId>:meta                 → small job metadata
+    //   job:<jobId>:prompt               → buyer's NaCl-encrypted prompt to provider
+    //   job:<jobId>:dlv                  → provider's NaCl-encrypted reply to buyer
+    //   rcpt:<jobId>:<ts>                → Settlement receipt
+    //   rating:<addr16>:<jobId>          → buyer's rating
+    //
+    // Flow: Client browses → Quick Ask → CoordiPay pay (real) + MBR float (real) →
+    //       inbox notification → Provider polls inbox → verifies CoordiPay →
+    //       runs LLM → delivers (encrypted) → Client polls → reads reply → rates.
+    //
+    // Cost model: CLIENT pays everything (Service fee + MBR float for boxes).
+    //             PROVIDER only earns. MBR float covers provider's box creation
+    //             for the prompt + delivery + meta. Excess is provider's safety buffer.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const MKT_KEY_MAX_PAYLOAD = 1200;            // safe cap for any JSON entity
+    // Box MBR formula: 2500 + 400 * (key_size + 32 + value_size) microAlgos.
+    // A ~1200-byte value at key length ~22 costs ~0.5 ALGO MBR per box. Provider
+    // creates the delivery box, so they need at least 0.5 ALGO from float.
+    // We send 1 ALGO to give them headroom for retries / overheads.
+    const MKT_MBR_FLOAT       = 1000000;         // 1.0 ALGO buyer→provider float at hire
+    const MKT_POLL_MS         = 12000;           // provider/client poll interval
+    const MKT_HEARTBEAT_MS    = 60000;           // profile heartbeat interval
+    const MKT_ONLINE_WINDOW   = 120000;          // green if heartbeat < 2 min
+    const MKT_RECENT_WINDOW   = 600000;          // yellow if heartbeat < 10 min
+
+    function mktShortAddr(addr, n) { return String(addr || "").slice(0, n || 16); }
+    function mktAgentKey(addr)             { return `agent:${mktShortAddr(addr)}`; }
+    function mktOfferKey(addr, offerId)    { return `offer:${mktShortAddr(addr)}:${offerId}`; }
+    function mktOfferIndexKey()            { return `offers:index`; }
+    function mktInboxKey(provAddr)         { return `inbox:${mktShortAddr(provAddr)}`; }
+    function mktJobMetaKey(jobId)          { return `job:${jobId}:meta`; }
+    function mktPromptKey(jobId)           { return `job:${jobId}:prompt`; }
+    function mktDeliveryKey(jobId)         { return `job:${jobId}:dlv`; }
+    function mktReceiptKey(jobId, ts)      { return `rcpt:${jobId}:${ts}`; }
+    function mktRatingKey(provAddr, jobId) { return `rating:${mktShortAddr(provAddr)}:${jobId}`; }
+
+    // Session-local tracking
+    const mktKnownJobIds        = new Set();
+    const mktClientNotifiedJobs = new Set();  // jobs we already showed "reply ready" for
+    const mktProviderProcessing = new Set();  // jobs currently being processed
+    const mktPairQueue          = [];         // for COMPARE 2 mode
+    let   mktPairModeOn         = false;
+    let   mktHeartbeatTimer     = null;
+    let   mktProviderLoopTimer  = null;
+    let   mktClientLoopTimer    = null;
+    let   mktTabActive          = "ask";
+
+    // ════ Low-level JSON wrappers ════
+    async function mktSaveJSON(key, obj) {
+      const json = JSON.stringify(obj);
+      if (json.length > MKT_KEY_MAX_PAYLOAD)
+        throw new Error(`Entity ${key} too large: ${json.length} > ${MKT_KEY_MAX_PAYLOAD} (Algorand tx args limit)`);
+      await window.createEntity(key, json);
+      trackedEntityIds.add(key);
+    }
+    async function mktUpdateJSON(key, obj) {
+      const json = JSON.stringify(obj);
+      if (json.length > MKT_KEY_MAX_PAYLOAD)
+        throw new Error(`Entity ${key} update too large: ${json.length} > ${MKT_KEY_MAX_PAYLOAD}`);
+      await window.updateEntity(key, json);
+    }
+    async function mktReadJSON(key) {
+      const raw = await window.readEntity(key);
+      if (raw == null) throw new Error(`Entity ${key} not found`);
+      return JSON.parse(raw);
+    }
+    async function mktUpsertJSON(key, obj) {
+      try { await mktUpdateJSON(key, obj); }
+      catch (e) { await mktSaveJSON(key, obj); }
+    }
+
+    // ════ Agent Profile + Heartbeat ════
+    async function mktCreateOrUpdateProfile(profile) {
+      const addr = accountAddress(myAccount);
+      const key  = mktAgentKey(addr);
+      const now  = Date.now();
+      let existing = null;
+      try { existing = await mktReadJSON(key); } catch (e) {}
+      const obj = {
+        name:               profile.name || (existing && existing.name) || "",
+        description:        profile.description || (existing && existing.description) || "",
+        skills:             profile.skills || (existing && existing.skills) || [],
+        model:              profile.model || (existing && existing.model) || "",
+        responseSLASeconds: profile.responseSLASeconds || (existing && existing.responseSLASeconds) || 300,
+        lastHeartbeat:      now,
+        createdAt:          existing ? existing.createdAt : now,
+        updatedAt:          now
+      };
+      await mktUpsertJSON(key, obj);
+      return key;
+    }
+
+    // Lightweight heartbeat: bump lastHeartbeat field only (no full profile rewrite if you don't want to)
+    async function mktSendHeartbeat() {
+      if (!myAccount) return;
+      try {
+        const addr = accountAddress(myAccount);
+        const key  = mktAgentKey(addr);
+        let prof;
+        try { prof = await mktReadJSON(key); } catch (e) { return; /* no profile yet */ }
+        prof.lastHeartbeat = Date.now();
+        await mktUpdateJSON(key, prof);
+        const self = document.getElementById("mktSelfStatus");
+        if (self) self.innerHTML = `🟢 online ${new Date().toLocaleTimeString()}`;
+      } catch (e) {
+        // silent - heartbeat best effort
+      }
+    }
+
+    function mktStartHeartbeat() {
+      if (mktHeartbeatTimer) clearInterval(mktHeartbeatTimer);
+      mktHeartbeatTimer = setInterval(mktSendHeartbeat, MKT_HEARTBEAT_MS);
+      mktSendHeartbeat();
+    }
+    function mktStopHeartbeat() {
+      if (mktHeartbeatTimer) { clearInterval(mktHeartbeatTimer); mktHeartbeatTimer = null; }
+    }
+
+    function mktStatusFromHeartbeat(lastHeartbeat) {
+      if (!lastHeartbeat) return { cls: "unknown", label: "?", text: "no heartbeat recorded" };
+      const age = Date.now() - Number(lastHeartbeat);
+      if (age < MKT_ONLINE_WINDOW)  return { cls: "online",  label: "online",  text: `seen ${Math.round(age/1000)}s ago` };
+      if (age < MKT_RECENT_WINDOW)  return { cls: "recent",  label: "recent",  text: `seen ${Math.round(age/60000)}m ago` };
+      return { cls: "offline", label: "offline", text: `seen ${Math.round(age/60000)}m ago` };
+    }
+
+    // ════ Offer registry ════
+    async function mktCreateOffer(offer) {
+      const addr    = accountAddress(myAccount);
+      const offerId = `o${Date.now().toString(36)}${Math.random().toString(36).slice(2,5)}`;
+      const key     = mktOfferKey(addr, offerId);
+      const now     = Date.now();
+      const obj     = {
+        offerId,
+        providerAddress: addr,
+        title:           offer.title || "",
+        description:     offer.description || "",
+        pricing:         offer.pricing || { mode: "flat", amountMicroAlgos: 100000 },
+        capabilities:    offer.capabilities || [],
+        tags:            offer.tags || [],
+        active:          true,
+        createdAt:       now,
+        updatedAt:       now
+      };
+      await mktSaveJSON(key, obj);
+      // Update index
+      const idxKey = mktOfferIndexKey();
+      let idx = { offerKeys: [] };
+      try { idx = await mktReadJSON(idxKey); } catch (e) { }
+      if (!idx.offerKeys.includes(key)) idx.offerKeys.push(key);
+      await mktUpsertJSON(idxKey, idx);
+      return { offerKey: key, offerId };
+    }
+
+    async function mktUpdateOffer(offerKey, patch) {
+      const current = await mktReadJSON(offerKey);
+      const updated = Object.assign({}, current, patch, { updatedAt: Date.now() });
+      await mktUpdateJSON(offerKey, updated);
+      return updated;
+    }
+
+    async function mktLoadAllOffers() {
+      let idx;
+      try { idx = await mktReadJSON(mktOfferIndexKey()); }
+      catch (e) { return []; }
+      const offers = [];
+      for (const k of (idx.offerKeys || [])) {
+        try {
+          const o = await mktReadJSON(k);
+          o._offerKey = k;
+          // Attach provider liveness
+          try {
+            const prof = await mktReadJSON(mktAgentKey(o.providerAddress));
+            o._provider = { name: prof.name, model: prof.model, lastHeartbeat: prof.lastHeartbeat };
+          } catch (e) {
+            o._provider = null;
+          }
+          offers.push(o);
+        } catch (e) { /* skip missing/corrupt */ }
+      }
+      return offers;
+    }
+
+    // ════ Quick Ask flow (client side) ════
+    async function mktQuickAsk(offerKey, promptText) {
+      if (!myAccount) throw new Error("Unlock first");
+      const buyer = accountAddress(myAccount);
+      const offer = await mktReadJSON(offerKey);
+      if (!offer.active) throw new Error("Offer is not active");
+      if (offer.providerAddress === buyer) throw new Error("Cannot ask yourself");
+
+      const promptClipped = clipForOnChain(String(promptText || ""), "Prompt");
+      if (!promptClipped) throw new Error("Empty prompt");
+
+      const jobId      = `j${Date.now().toString(36)}${Math.random().toString(36).slice(2,4)}`;
+      const resource   = `ask:${jobId}`;
+      const price      = offer.pricing.amountMicroAlgos;
+      const provider   = offer.providerAddress;
+
+      window.logToUI(`<hr>🛒 Quick Ask started for "${window.escapeHTML(offer.title)}" — job <span class='mono'>${window.escapeHTML(jobId)}</span>`);
+      window.logToUI(`💼 Total cost: ${(price/1e6).toFixed(6)} ALGO service + ${(MKT_MBR_FLOAT/1e6).toFixed(6)} ALGO MBR float`);
+      // Show prompt in session history
+      addHistory("Buyer (you)", `Prompt → ${offer.title} [${jobId}]`, promptClipped);
+      showTools();
+
+      // 1) Service payment (direct on-chain settlement)
+      const challenge = window.coordiPay.request({
+        priceMicroAlgos: price,
+        receiver:        provider,
+        resource
+      });
+      window.logToUI(`📋 Payment request prepared (resource=<span class='mono'>${window.escapeHTML(resource)}</span>, nonce=<span class='mono'>${window.escapeHTML(challenge.body.nonce.slice(0,8))}...</span>)`);
+      const proof = await window.coordiPay.pay(challenge, myAccount);
+      const payUrl = mktExplorerLink(proof['paymentTxId']);
+      window.logToUI(`<span class='ok'>✅ Payment confirmed on-chain:<br>&nbsp;&nbsp;txid <a class="mkt-txlink" target="_blank" rel="noopener" href="${payUrl}">${window.escapeHTML(proof['paymentTxId'])}</a></span>`);
+
+      // 2) MBR float payment so provider can create the delivery box without paying
+      window.logToUI("📦 Sending MBR float to provider (covers their box-creation MBR)...");
+      const sp = await algodClient.getTransactionParams().do();
+      const floatTxn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+        from: buyer, to: provider, amount: MKT_MBR_FLOAT,
+        suggestedParams: sp,
+        note: new TextEncoder().encode(JSON.stringify({ purpose: "mbr-float", jobId }))
+      });
+      const signedFloat = floatTxn.signTxn(myAccount.sk);
+      const { txId: floatTxId } = await algodClient.sendRawTransaction(signedFloat).do();
+      await algosdk.waitForConfirmation(algodClient, floatTxId, 6);
+      const floatUrl = mktExplorerLink(floatTxId);
+      window.logToUI(`<span class='ok'>✅ MBR float confirmed:<br>&nbsp;&nbsp;txid <a class="mkt-txlink" target="_blank" rel="noopener" href="${floatUrl}">${window.escapeHTML(floatTxId)}</a></span>`);
+
+      // 3) Save encrypted prompt entity (buyer pays MBR for this box)
+      const promptEnvelope = packForRecipient(promptClipped, provider, myAccount);
+      await window.createEntity(mktPromptKey(jobId), promptEnvelope);
+      trackedEntityIds.add(mktPromptKey(jobId));
+
+      // 4) Save job meta (buyer pays MBR for this box)
+      const meta = {
+        jobId,
+        offerKey,
+        offerTitle:       offer.title,
+        buyerAddress:     buyer,
+        providerAddress: provider,
+        amountMicroAlgos: price,
+        mbrFloat:         MKT_MBR_FLOAT,
+        paymentTxId:        proof["paymentTxId"],
+        paymentResource:     resource,
+        mbrFloatTxId:     floatTxId,
+        status:           "pending",
+        paidAt:           Date.now(),
+        createdAt:        Date.now(),
+        updatedAt:        Date.now()
+      };
+      await mktSaveJSON(mktJobMetaKey(jobId), meta);
+
+      // 5) Save settlement receipt
+      const ts = Date.now();
+      await mktSaveJSON(mktReceiptKey(jobId, ts), {
+        jobId, txId: proof["paymentTxId"],
+        amountMicroAlgos: price,
+        payer: buyer, payee: provider,
+        method: "CoordiPay",
+        mbrFloatTxId: floatTxId, mbrFloatAmount: MKT_MBR_FLOAT,
+        createdAt: ts
+      });
+
+      // 6) Append to provider's inbox so their loop picks it up
+      const inboxKey = mktInboxKey(provider);
+      let inbox = { pending: [], processed: [], updatedAt: 0 };
+      try { inbox = await mktReadJSON(inboxKey); } catch (e) { /* first time, will be created */ }
+      inbox.pending = inbox.pending || [];
+      inbox.pending.push({ jobId, t: Date.now(), buyerAddr16: mktShortAddr(buyer) });
+      if (inbox.pending.length > 10) inbox.pending = inbox.pending.slice(-10);
+      inbox.updatedAt = Date.now();
+      try {
+        await mktUpdateJSON(inboxKey, inbox);
+      } catch (e) {
+        // Inbox might not exist yet — buyer creates it. (Provider could also pre-create.)
+        await mktSaveJSON(inboxKey, inbox);
+      }
+      window.logToUI(`📬 Inbox notification sent to provider <span class='mono'>${window.escapeHTML(mktShortAddr(provider, 10))}...</span>`);
+
+      mktKnownJobIds.add(jobId);
+      return { jobId, proof, floatTxId };
+    }
+
+    // ════ Provider auto-respond loop ════
+    async function mktProviderPollOnce() {
+      if (!myAccount) return;
+      const me = accountAddress(myAccount);
+      const inboxKey = mktInboxKey(me);
+      let inbox;
+      try { inbox = await mktReadJSON(inboxKey); }
+      catch (e) {
+        // No inbox box exists yet — silent during automatic polling (every 12s would spam),
+        // but a manual run via PROCESS NOW logs once for clarity
+        if (window._mktManualPoll) {
+          window.logToUI(`<span class='hint'>📥 No inbox box yet for ${window.escapeHTML(mktShortAddr(me))} — nobody has asked you yet.</span>`);
+        }
+        return;
+      }
+      const pending = (inbox.pending || []).filter(p =>
+        !mktProcessedLocal.has(p.jobId) && !(inbox.processed || []).includes(p.jobId)
+      );
+      if (pending.length === 0) {
+        if (window._mktManualPoll) {
+          window.logToUI(`<span class='hint'>📥 Inbox has ${(inbox.processed || []).length} processed, 0 pending. Nothing to do.</span>`);
+        }
+        return;
+      }
+      window.logToUI(`<hr>📥 Provider poll: ${pending.length} pending job(s) in inbox`);
+      // LLM availability is required to actually answer
+      if (!window._llmReady) {
+        window.logToUI(`<span class='err'>❌ No LLM loaded — cannot process asks. Click 🤖 LLM SETUP on the BE A PROVIDER tab to load one (local WebLLM or cloud API). The job stays pending in your inbox until then.</span>`);
+        return;
+      }
+
+      for (const item of pending) {
+        if (mktProviderProcessing.has(item.jobId)) continue;
+        mktProviderProcessing.add(item.jobId);
+        try {
+          window.logToUI(`<hr>📥 Incoming ask: <span class='mono'>${window.escapeHTML(item.jobId)}</span>`);
+
+          // Read meta (provider is read-only on buyer-owned meta — that's fine)
+          const meta = await mktReadJSON(mktJobMetaKey(item.jobId));
+
+          // Idempotency: if delivery already exists on-chain, we've handled this. Skip.
+          const dKey = mktDeliveryKey(item.jobId);
+          let alreadyDelivered = false;
+          try {
+            const existing = await window.readEntity(dKey);
+            if (existing != null) alreadyDelivered = true;
+          } catch (e) { /* not delivered */ }
+          if (alreadyDelivered) {
+            window.logToUI(`<span class='hint'>📤 ${item.jobId} already delivered (delivery box exists on-chain) — skipping.</span>`);
+            mktProcessedLocal.add(item.jobId);
+            continue;
+          }
+
+          // Verify payment proof on-chain
+          window.logToUI(`🔎 Verifying payment proof for ${item.jobId}...`);
+          const proofTxId    = meta.paymentTxId    || meta.x402Proof;
+          const proofResource = meta.paymentResource || meta.x402Resource;
+          const verify = await window.coordiPay.verify(
+            { "paymentTxId": proofTxId },
+            { expectedReceiver: me, expectedAmount: meta.amountMicroAlgos, expectedResource: proofResource }
+          );
+          if (!verify.valid) {
+            window.logToUI(`<span class='err'>❌ Payment verification FAILED for ${item.jobId}: ${window.escapeHTML(verify.reason)}. Marking locally-skipped.</span>`);
+            mktProcessedLocal.add(item.jobId);
+            continue;
+          }
+          window.logToUI(`<span class='ok'>✅ Payment verified on-chain (round ${verify.round}, ${(verify.amount/1e6).toFixed(6)} ALGO)</span>`);
+
+          // NOTE: We deliberately do NOT update meta.status here. The USM contract
+          // enforces owner-only mutability — the meta box was created by the buyer
+          // so the provider cannot update it. Status is derived from on-chain entity
+          // existence instead: delivery exists → "delivered", rating exists → "rated".
+
+          // Decrypt prompt
+          const promptEnvelope = await window.readEntity(mktPromptKey(item.jobId));
+          const prompt = unpackFromSender(promptEnvelope, meta.buyerAddress, myAccount);
+          window.logToUI(`📝 Prompt decrypted (${prompt.length} chars). Running LLM...`);
+          addHistory(`Buyer ${mktShortAddr(meta.buyerAddress, 10)}...`, `Prompt → me [${item.jobId}]`, prompt);
+          showTools();
+
+          // Run LLM
+          const systemPrompt = "You are a paid AI agent on an open marketplace. Answer the client's question accurately and helpfully. Be concise.";
+          const reply = await window.callLocalAI(
+            systemPrompt,
+            prompt,
+            { label: "Marketplace Agent", maxTokens: 280, timeoutMs: 180000 }
+          );
+          const clipped = clipForOnChain(reply, "Agent reply");
+          addHistory("My agent (you)", `Reply → buyer [${item.jobId}]`, clipped);
+
+          // Encrypt and save delivery (provider-owned box). Existence of this box IS
+          // the on-chain signal that the job is delivered — no meta.status update needed.
+          const envelope = packForRecipient(clipped, meta.buyerAddress, myAccount);
+          await window.createEntity(dKey, envelope);
+          trackedEntityIds.add(dKey);
+
+          window.logToUI(`<span class='ok'>📤 Reply delivered for ${item.jobId} (${clipped.length} chars encrypted). Buyer's poll will detect within 12s.</span>`);
+
+          // Local-only "processed" tracking — no on-chain inbox update (buyer owns inbox)
+          mktProcessedLocal.add(item.jobId);
+        } catch (e) {
+          window.logToUI(`<span class='err'>❌ Provider failed on ${item.jobId}: ${window.escapeHTML(e.message)}</span>`);
+        } finally {
+          mktProviderProcessing.delete(item.jobId);
+        }
+      }
+    }
+
+    // Local-only set of jobIds the provider has handled this session (or detected as
+    // already delivered on-chain). Used to skip in the poll loop without writing to
+    // the buyer-owned inbox.
+    const mktProcessedLocal = new Set();
+
+    async function mktMarkInboxProcessed(inboxKey, jobId, outcome) {
+      let inbox;
+      try { inbox = await mktReadJSON(inboxKey); } catch (e) { return; }
+      inbox.pending = (inbox.pending || []).filter(p => p.jobId !== jobId);
+      inbox.processed = inbox.processed || [];
+      if (!inbox.processed.includes(jobId)) inbox.processed.push(jobId);
+      if (inbox.processed.length > 10) inbox.processed = inbox.processed.slice(-10);
+      inbox.updatedAt = Date.now();
+      try { await mktUpdateJSON(inboxKey, inbox); } catch (e) {}
+    }
+
+    function mktStartProviderLoop() {
+      if (mktProviderLoopTimer) clearInterval(mktProviderLoopTimer);
+      mktProviderLoopTimer = setInterval(mktProviderPollOnce, MKT_POLL_MS);
+      mktProviderPollOnce();
+      mktUpdateLoopStatusUI(true);
+    }
+    function mktStopProviderLoop() {
+      if (mktProviderLoopTimer) { clearInterval(mktProviderLoopTimer); mktProviderLoopTimer = null; }
+      mktUpdateLoopStatusUI(false);
+    }
+    function mktUpdateLoopStatusUI(running) {
+      const s = document.getElementById("mktLoopStatus");
+      const b = document.getElementById("mktLoopBtn");
+      if (s) s.innerHTML = running ? '🟢 RUNNING' : '⏸ idle';
+      if (b) b.innerText = running ? "⏸ STOP AUTO-RESPOND" : "▶ START AUTO-RESPOND";
+    }
+    window.mktToggleProviderLoop = function() {
+      if (mktProviderLoopTimer) mktStopProviderLoop(); else mktStartProviderLoop();
+    };
+
+    // Manual one-shot trigger (debugging aid)
+    window.mktProcessNow = async function() {
+      if (!myAccount) { window.logToUI("<span class='err'>Unlock first (BE A PROVIDER tab).</span>"); return; }
+      window.logToUI("<hr>🔄 Manual provider poll triggered...");
+      mktUpdateReadinessUI();
+      window._mktManualPoll = true;
+      try {
+        await mktProviderPollOnce();
+        window.logToUI("<span class='ok'>🔄 Manual poll complete.</span>");
+      } catch (e) {
+        window.logToUI(`<span class='err'>❌ Manual poll error: ${window.escapeHTML(e.message)}</span>`);
+      } finally {
+        window._mktManualPoll = false;
+      }
+    };
+
+    // Show what's currently in the provider's inbox box
+    window.mktShowInbox = async function() {
+      if (!myAccount) { window.logToUI("<span class='err'>Unlock first (BE A PROVIDER tab).</span>"); return; }
+      const me = accountAddress(myAccount);
+      const key = mktInboxKey(me);
+      window.logToUI(`<hr>📥 Reading inbox box <span class='mono'>${window.escapeHTML(key)}</span>...`);
+      try {
+        const inbox = await mktReadJSON(key);
+        const pending = (inbox.pending || []);
+        const processed = (inbox.processed || []);
+        window.logToUI(`<span class='ok'>📥 Inbox loaded.</span> Pending: <b>${pending.length}</b>, Processed: <b>${processed.length}</b>`);
+        if (pending.length > 0) {
+          window.logToUI("&nbsp;&nbsp;Pending jobs (oldest first):");
+          for (const p of pending) {
+            const age = ((Date.now() - p.t)/1000).toFixed(0);
+            window.logToUI(`&nbsp;&nbsp;&nbsp;&nbsp;• <span class='mono'>${window.escapeHTML(p.jobId)}</span> from buyer <span class='mono'>${window.escapeHTML(p.buyerAddr16 || "?")}...</span> (${age}s old)`);
+          }
+        }
+        if (processed.length > 0) {
+          window.logToUI(`&nbsp;&nbsp;Processed (last ${processed.length}): <span class='mono'>${processed.map(window.escapeHTML).join(", ")}</span>`);
+        }
+        if (pending.length === 0 && processed.length === 0) {
+          window.logToUI("&nbsp;&nbsp;<i>Inbox is empty — no asks received yet.</i>");
+        }
+      } catch (e) {
+        window.logToUI(`<span class='warn'>⚠️ No inbox box exists yet. This is normal if nobody has asked you. (${window.escapeHTML(e.message)})</span>`);
+      }
+    };
+
+    // Readiness UI — shows account, LLM, loop, inbox-ish state in the provider card AND globally
+    function mktUpdateReadinessUI() {
+      const acct = myAccount ? "✅" : "❌";
+      const llm  = window._llmReady ? "✅" : "❌";
+      const loop = mktProviderLoopTimer ? "✅" : "⏸";
+      // Detailed strip on provider tab
+      const el = document.getElementById("mktProviderReadiness");
+      if (el) {
+        const acctLong = myAccount ? "✅ signed in" : "❌ not signed in";
+        const llmLong  = window._llmReady ? "✅ loaded" : "❌ NOT loaded — click 🤖 LLM SETUP";
+        const loopLong = mktProviderLoopTimer ? "✅ running" : "⏸ stopped — click ▶ START AUTO-RESPOND";
+        el.innerHTML = `Account: ${acctLong} &nbsp;·&nbsp; LLM: ${llmLong} &nbsp;·&nbsp; Loop: ${loopLong}`;
+      }
+      // Compact strip in main banner (visible from every tab)
+      const g = document.getElementById("mktGlobalReadiness");
+      if (g) {
+        g.innerHTML = myAccount
+          ? `· acct ${acct} · llm ${llm} · loop ${loop}`
+          : "";
+      }
+    }
+    // Refresh readiness display every 2s so it reflects state changes
+    setInterval(mktUpdateReadinessUI, 2000);
+
+    // ════ Top-level tab navigation (UI-only; doesn't affect data flow) ════
+    // The body has three top tabs that swap which "panel" is visible:
+    //   marketplace → #marketplaceView   (default landing)
+    //   session     → #sessionTools      (Session History + global cleanup)
+    //   log         → #log               (streaming activity log)
+    // The Lab Mode / LLM Setup flow hides the tab bar and shows #setupView etc.
+    // Returning to the marketplace re-shows the tab bar.
+    const TOP_TAB_PANELS = {
+      marketplace: ["marketplaceView"],
+      session:     ["sessionTools"],
+      log:         ["log"]
+    };
+    let _activeTopTab = "marketplace";
+    window.switchTopTab = function(tab) {
+      if (!TOP_TAB_PANELS[tab]) return;
+      _activeTopTab = tab;
+      // Update tab button active state
+      document.querySelectorAll(".top-tab").forEach(b => {
+        b.classList.toggle("active", b.getAttribute("data-tab") === tab);
+      });
+      // Hide all top-tab panels, then show the chosen one
+      for (const ids of Object.values(TOP_TAB_PANELS)) {
+        for (const id of ids) {
+          const el = document.getElementById(id);
+          if (el) el.style.display = "none";
+        }
+      }
+      for (const id of TOP_TAB_PANELS[tab]) {
+        const el = document.getElementById(id);
+        if (el) {
+          el.style.display = "";       // restore default
+          el.classList.remove("hidden");
+        }
+      }
+      // Stash active tab so showTools() can respect it
+      window._activeTopTab = tab;
+      // If switching to log, scroll to bottom so newest line is visible
+      if (tab === "log") {
+        const lg = document.getElementById("log");
+        if (lg) lg.scrollTop = lg.scrollHeight;
+      }
+    };
+
+    // When special views (LAB MODE, LLM SETUP, role picker) take over the page,
+    // hide the top tab bar. When we return to a top-tab panel, show it again.
+    function _hideTopTabsForSpecialView() {
+      const bar = document.getElementById("topTabs");
+      if (bar) bar.style.display = "none";
+      for (const ids of Object.values(TOP_TAB_PANELS)) {
+        for (const id of ids) {
+          const el = document.getElementById(id);
+          if (el) el.style.display = "none";
+        }
+      }
+    }
+    function _showTopTabsAndActivate(tab) {
+      const bar = document.getElementById("topTabs");
+      if (bar) bar.style.display = "";
+      window.switchTopTab(tab || _activeTopTab || "marketplace");
+    }
+    window._hideTopTabsForSpecialView = _hideTopTabsForSpecialView;
+    window._showTopTabsAndActivate    = _showTopTabsAndActivate;
+
+    // Default landing: marketplace tab active
+    setTimeout(() => window.switchTopTab("marketplace"), 0);
+
+    // ════ Client reply poll ════
+    async function mktClientPollOnce() {
+      if (!myAccount) return;
+      const me = accountAddress(myAccount);
+      let anyNew = false;
+      for (const jobId of Array.from(mktKnownJobIds)) {
+        try {
+          const meta = await mktReadJSON(mktJobMetaKey(jobId));
+          if (meta.buyerAddress !== me) continue;
+          if (mktClientNotifiedJobs.has(jobId)) continue;
+          // Existence-based delivery check (we deliberately don't trust meta.status — provider
+          // can't update it, so it stays "pending" forever even after delivery)
+          let envelope = null;
+          try { envelope = await window.readEntity(mktDeliveryKey(jobId)); } catch (e) { /* not yet delivered */ }
+          if (!envelope) continue;
+          window.logToUI(`<span class='ok'>📬 Reply received for ${window.escapeHTML(meta.offerTitle || jobId)}</span>`);
+          mktClientNotifiedJobs.add(jobId);
+          anyNew = true;
+          // Auto-decrypt + log to session history so user sees the reply without extra clicks
+          try {
+            const text = unpackFromSender(envelope, meta.providerAddress, myAccount);
+            addHistory(`Provider ${mktShortAddr(meta.providerAddress, 10)}...`, `Reply [${jobId}]`, text);
+            showTools();
+          } catch (e) {
+            window.logToUI(`<span class='warn'>⚠️ Could not auto-decrypt reply for ${jobId}: ${window.escapeHTML(e.message)}</span>`);
+          }
+        } catch (e) { /* skip */ }
+      }
+      if (anyNew && mktTabActive === "jobs") await window.mktRefreshJobs();
+    }
+    function mktStartClientLoop() {
+      if (mktClientLoopTimer) clearInterval(mktClientLoopTimer);
+      mktClientLoopTimer = setInterval(mktClientPollOnce, MKT_POLL_MS);
+    }
+
+    // ════ Ratings ════
+    async function mktRateProvider(jobId, providerAddress, stars, review) {
+      const buyer = accountAddress(myAccount);
+      const obj = {
+        stars:        Math.max(1, Math.min(5, parseInt(stars, 10) || 0)),
+        review:       String(review || "").slice(0, 180),
+        buyerAddress: buyer,
+        jobId,
+        createdAt:    Date.now()
+      };
+      const key = mktRatingKey(providerAddress, jobId);
+      await mktSaveJSON(key, obj);
+      // No meta update — "rated" status derives from existence of this rating box.
+      // (Even though buyer owns meta, we keep status purely existence-derived for consistency
+      // with the cross-actor flow where status updates are impossible.)
+      return obj;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MARKETPLACE UI HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    function mktExplorerLink(txId) {
+      // Pera Explorer (modern, well-maintained for Algorand)
+      return `https://testnet.explorer.perawallet.app/tx/${txId}`;
+    }
+
+    window.openLabMode = function() {
+      window._labModeRequested = true; // signal to startLoadingAI to go to mode picker
+      if (window._hideTopTabsForSpecialView) window._hideTopTabsForSpecialView();
+      document.getElementById("marketplaceView").classList.add("hidden");
+      document.getElementById("setupView").classList.remove("hidden");
+      window.scrollTo(0, 0);
+      window.logToUI("🧪 Lab mode requested. Load an LLM provider to access the paired-agent modes.");
+    };
+
+    window.mktOpenLLMSetup = function() {
+      window._labModeRequested = false; // after load, go straight back to marketplace
+      if (window._hideTopTabsForSpecialView) window._hideTopTabsForSpecialView();
+      document.getElementById("marketplaceView").classList.add("hidden");
+      document.getElementById("setupView").classList.remove("hidden");
+      window.scrollTo(0, 0);
+      window.logToUI("🤖 Load an LLM (local or cloud) so your auto-respond loop can answer paid asks. You'll return to the marketplace after loading.");
+    };
+
+    window.mktUnlock = function() {
+      try {
+        const mn = document.getElementById("mktMnemonic").value.trim();
+        validateMnemonic(mn);
+        myAccount = algosdk.mnemonicToSecretKey(mn);
+        const addr = accountAddress(myAccount);
+        // CRITICAL: synchronize contract wrapper's signer state with marketplace account.
+        // createEntity/updateEntity short-circuit getSigner() if window.account is already set,
+        // so we MUST overwrite window.account/sender/sk here. Otherwise the contract signs with
+        // a stale account and `txn Sender; ==; assert` fires (entity-owner mismatch).
+        window._activeMnemonic = mn;
+        window.account = myAccount;
+        window.sender  = addr;
+        window.sk      = myAccount.sk;
+        try { localStorage.setItem("mnemonic", mn); } catch (e) {}
+        document.getElementById("mktProviderAuth").classList.add("hidden");
+        document.getElementById("mktProviderForms").classList.remove("hidden");
+        document.getElementById("mktAddrLine").innerHTML =
+          `<b style="color:var(--neon-green);">You are:</b> <span class="mono">${window.escapeHTML(addr)}</span>`;
+        const self = document.getElementById("mktSelfStatus");
+        if (self) self.innerHTML = `🔓 <span class="mono">${window.escapeHTML(addr.slice(0,10))}...${window.escapeHTML(addr.slice(-6))}</span>`;
+        window.logToUI(`<span class='ok'>🔓 Signed in as ${window.escapeHTML(addr.slice(0,10))}...</span>`);
+        mktStartHeartbeat();
+        mktStartClientLoop();
+        // Auto-start provider loop. It's cheap (one box read per 12s) and saves the user
+        // from having to remember to click ▶ START AUTO-RESPOND. If they aren't a provider
+        // and have no inbox box, the loop returns silently every cycle.
+        if (!mktProviderLoopTimer) mktStartProviderLoop();
+        showTools();
+        if (mktTabActive === "jobs") window.mktRefreshJobs();
+      } catch (e) {
+        window.logToUI(`<span class='err'>❌ Unlock failed: ${window.escapeHTML(e.message)}</span>`);
+      }
+    };
+
+    window.mktUnlockFromJobs = function() {
+      const v = document.getElementById("mktJobsMnemonic").value.trim();
+      document.getElementById("mktMnemonic").value = v;
+      window.mktUnlock();
+      if (myAccount) {
+        document.getElementById("mktJobsAuth").classList.add("hidden");
+        document.getElementById("mktJobsControls").classList.remove("hidden");
+        window.mktRefreshJobs();
+      }
+    };
+
+    window.mktSwitchTab = function(tab) {
+      mktTabActive = tab;
+      for (const t of ["ask", "provide", "jobs"]) {
+        const el = document.getElementById("mkt" + t.charAt(0).toUpperCase() + t.slice(1) + "Tab");
+        if (el) el.classList.toggle("hidden", t !== tab);
+      }
+      if (tab === "ask")  window.mktBrowseOffers().catch(() => {});
+      if (tab === "jobs") {
+        if (!myAccount) {
+          document.getElementById("mktJobsAuth").classList.remove("hidden");
+          document.getElementById("mktJobsControls").classList.add("hidden");
+          document.getElementById("mktJobsList").innerHTML = "";
+        } else {
+          document.getElementById("mktJobsAuth").classList.add("hidden");
+          document.getElementById("mktJobsControls").classList.remove("hidden");
+          window.mktRefreshJobs().catch(() => {});
+        }
+      }
+      if (tab === "provide") {
+        if (myAccount) {
+          document.getElementById("mktProviderAuth").classList.add("hidden");
+          document.getElementById("mktProviderForms").classList.remove("hidden");
+        } else {
+          document.getElementById("mktProviderAuth").classList.remove("hidden");
+          document.getElementById("mktProviderForms").classList.add("hidden");
+        }
+      }
+    };
+
+    window.mktSaveProfile = async function() {
+      try {
+        if (!myAccount) throw new Error("Unlock marketplace first");
+        const profile = {
+          name:               document.getElementById("mktProfName").value.trim(),
+          description:        document.getElementById("mktProfDesc").value.trim(),
+          skills:             document.getElementById("mktProfSkills").value.split(",").map(s => s.trim()).filter(Boolean),
+          model:              document.getElementById("mktProfModel").value.trim(),
+          responseSLASeconds: parseInt(document.getElementById("mktProfSLA").value, 10) || 300
+        };
+        if (!profile.name) throw new Error("Profile name required");
+        window.logToUI("💾 Saving agent profile (heartbeat will auto-update every minute)...");
+        const key = await mktCreateOrUpdateProfile(profile);
+        window.logToUI(`<span class='ok'>✅ Profile saved: <span class='mono'>${window.escapeHTML(key)}</span></span>`);
+      } catch (e) {
+        window.logToUI(`<span class='err'>❌ Profile save failed: ${window.escapeHTML(e.message)}</span>`);
+      }
+    };
+
+    window.mktPublishOffer = async function() {
+      try {
+        if (!myAccount) throw new Error("Unlock marketplace first");
+        const offer = {
+          title:        document.getElementById("mktOfferTitle").value.trim(),
+          description:  document.getElementById("mktOfferDesc").value.trim(),
+          pricing: {
+            mode:             document.getElementById("mktOfferMode").value,
+            amountMicroAlgos: parseInt(document.getElementById("mktOfferPrice").value, 10) || 100000
+          },
+          tags:         document.getElementById("mktOfferTags").value.split(",").map(s => s.trim()).filter(Boolean),
+          capabilities: document.getElementById("mktOfferCaps").value.split(",").map(s => s.trim()).filter(Boolean)
+        };
+        if (!offer.title) throw new Error("Offer title required");
+        window.logToUI(`📢 Publishing offer "${window.escapeHTML(offer.title)}"...`);
+        const { offerKey } = await mktCreateOffer(offer);
+        window.logToUI(`<span class='ok'>✅ Offer published: <span class='mono'>${window.escapeHTML(offerKey)}</span></span>`);
+        document.getElementById("mktOfferTitle").value = "";
+        document.getElementById("mktOfferDesc").value  = "";
+        await window.mktRefreshMyOffers();
+      } catch (e) {
+        window.logToUI(`<span class='err'>❌ Publish failed: ${window.escapeHTML(e.message)}</span>`);
+      }
+    };
+
+    // Deterministic avatar from address+name
+    function mktAvatarFor(addr, name) {
+      const s = String(addr || "") + String(name || "");
+      let h = 0;
+      for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) & 0xffffff;
+      const hues = [142, 195, 38, 168, 280, 22, 320, 95];
+      const hue = hues[Math.abs(h) % hues.length];
+      const color = `hsl(${hue}, 80%, 55%)`;
+      const initial = String(name || "?").trim().charAt(0).toUpperCase() || "?";
+      return { color, initial };
+    }
+
+    // ════ Offer card renderer (v11: polished) ════
+    function mktRenderOfferCard(offer, options) {
+      const opts = options || {};
+      const card = document.createElement("div");
+      card.className = "mkt-offer-card";
+      const status = mktStatusFromHeartbeat(offer._provider && offer._provider.lastHeartbeat);
+      const pricing = offer.pricing || { mode: "?", amountMicroAlgos: 0 };
+      const provName  = (offer._provider && offer._provider.name)  || "Anonymous Agent";
+      const provModel = (offer._provider && offer._provider.model) || "model unknown";
+      const av = mktAvatarFor(offer.providerAddress, provName);
+      const tags = (offer.tags || []).slice(0, 6).map(t =>
+        `<span class="mkt-tag">${window.escapeHTML(t)}</span>`).join("");
+
+      card.innerHTML = `
+        <div class="mkt-offer-header">
+          <div class="mkt-avatar" style="background:${av.color};">${window.escapeHTML(av.initial)}<span class="mkt-avatar-dot ${status.cls}" title="${status.text}"></span></div>
+          <div style="flex:1; min-width:0;">
+            <div class="mkt-offer-title">${window.escapeHTML(offer.title || "(untitled)")}${offer.active ? '' : ' <span style="color:var(--warn); font-size:11px;">[INACTIVE]</span>'}</div>
+            <div class="mkt-offer-meta">🤖 ${window.escapeHTML(provName)} · <b>${window.escapeHTML(status.label)}</b> <span class="hint">(${window.escapeHTML(status.text)})</span></div>
+            <div class="mkt-offer-meta">⚙️ ${window.escapeHTML(provModel)}</div>
+          </div>
+        </div>
+        <div class="mkt-offer-desc">${window.escapeHTML(offer.description || "No description.")}</div>
+        <div class="mkt-tags">${tags}</div>
+        <div class="mkt-offer-price-line">
+          <div>
+            <div class="mkt-price-tag">${(pricing.amountMicroAlgos/1e6).toFixed(6)} ALGO</div>
+            <div class="mkt-price-sub">${window.escapeHTML(pricing.mode)} · paid via CoordiPay</div>
+          </div>
+        </div>
+      `;
+
+      const actionBar = document.createElement("div");
+      actionBar.className = "mkt-card-actions";
+      if (opts.showAsk) {
+        const askBtn = document.createElement("button");
+        askBtn.className = "smallbtn";
+        askBtn.textContent = mktPairModeOn ? "🎭 SELECT" : (status.cls === "offline" ? "💬 ASK (offline)" : "💬 ASK THIS AGENT");
+        askBtn.onclick = () => {
+          if (mktPairModeOn) {
+            if (mktPairQueue.find(o => o._offerKey === offer._offerKey)) {
+              window.logToUI("Already selected.");
+              return;
+            }
+            if (mktPairQueue.length >= 2) {
+              window.logToUI("Already have 2 selected.");
+              return;
+            }
+            mktPairQueue.push(offer);
+            card.classList.add("mkt-selected-for-pair");
+            document.getElementById("mktPairCount").textContent = `(${mktPairQueue.length}/2 selected)`;
+            if (mktPairQueue.length === 2) mktShowPairPromptForm();
+          } else {
+            mktShowSingleAskForm(card, offer);
+          }
+        };
+        actionBar.appendChild(askBtn);
+      }
+      if (opts.showToggle) {
+        const btn = document.createElement("button");
+        btn.className = "secondary smallbtn";
+        btn.textContent = offer.active ? "⏸ DEACTIVATE" : "▶ ACTIVATE";
+        btn.onclick = async () => {
+          try {
+            await mktUpdateOffer(offer._offerKey, { active: !offer.active });
+            window.logToUI(`<span class='ok'>✅ Offer ${offer.active ? 'deactivated' : 'activated'}</span>`);
+            await window.mktRefreshMyOffers();
+          } catch (e) {
+            window.logToUI(`<span class='err'>❌ ${window.escapeHTML(e.message)}</span>`);
+          }
+        };
+        actionBar.appendChild(btn);
+      }
+      card.appendChild(actionBar);
+      return card;
+    }
+
+    function mktShowSingleAskForm(card, offer) {
+      // Lazy unlock: prompt for mnemonic inline if we don't have an account yet
+      if (!myAccount) {
+        document.querySelectorAll(".mkt-ask-form").forEach(el => el.remove());
+        const form = document.createElement("div");
+        form.className = "mkt-ask-form";
+        form.innerHTML = `
+          <div class="hint" style="margin-bottom:6px;">🔑 To pay this agent you need a TestNet account. Paste your 25-word mnemonic:</div>
+          <input type="password" placeholder="25-word mnemonic" autocomplete="off" />
+          <div class="hint" style="margin: 6px 0;">Stays in this tab's memory only. Used to sign the CoordiPay payment + MBR float.</div>
+          <button class="smallbtn">🔑 UNLOCK &amp; CONTINUE</button>
+          <button class="secondary smallbtn">CANCEL</button>
+        `;
+        const input = form.querySelector("input");
+        const [okBtn, cancelBtn] = form.querySelectorAll("button");
+        cancelBtn.onclick = () => form.remove();
+        okBtn.onclick = () => {
+          try {
+            const mn = input.value.trim();
+            validateMnemonic(mn);
+            myAccount = algosdk.mnemonicToSecretKey(mn);
+            const addr = accountAddress(myAccount);
+            // Sync contract wrapper state — see mktUnlock for the why
+            window._activeMnemonic = mn;
+            window.account = myAccount;
+            window.sender  = addr;
+            window.sk      = myAccount.sk;
+            try { localStorage.setItem("mnemonic", mn); } catch (e) {}
+            const self = document.getElementById("mktSelfStatus");
+            if (self) self.innerHTML = `🔓 <span class="mono">${window.escapeHTML(addr.slice(0,10))}...${window.escapeHTML(addr.slice(-6))}</span>`;
+            window.logToUI(`<span class='ok'>🔓 Signed in as ${window.escapeHTML(addr.slice(0,10))}...</span>`);
+            mktStartHeartbeat();
+            mktStartClientLoop();
+            showTools();
+            form.remove();
+            mktShowSingleAskForm(card, offer);
+          } catch (e) {
+            window.logToUI(`<span class='err'>❌ ${window.escapeHTML(e.message)}</span>`);
+          }
+        };
+        card.appendChild(form);
+        return;
+      }
+      // Unlocked: real ask form
+      document.querySelectorAll(".mkt-ask-form").forEach(el => el.remove());
+      const form = document.createElement("div");
+      form.className = "mkt-ask-form";
+      const servicePrice = offer.pricing.amountMicroAlgos;
+      const total = servicePrice + MKT_MBR_FLOAT;
+      form.innerHTML = `
+        <textarea rows="3" placeholder="Your question for this agent (under 1100 chars)..." style="width:100%;"></textarea>
+        <div class="mkt-cost-breakdown">
+          <table>
+            <tr><td>Service fee → provider:</td><td>${(servicePrice/1e6).toFixed(6)} ALGO</td></tr>
+            <tr><td>MBR float (covers provider's box reservations):</td><td>${(MKT_MBR_FLOAT/1e6).toFixed(6)} ALGO</td></tr>
+            <tr class="total"><td>Total you pay:</td><td>${(total/1e6).toFixed(6)} ALGO</td></tr>
+          </table>
+          <div style="margin-top:6px; color:#888; font-size:10px;">Two real TestNet transactions. Provider verifies the payment proof on-chain before responding. AlgoExplorer links appear in the log.</div>
+        </div>
+        <button class="smallbtn">💳 PAY &amp; SEND</button>
+        <button class="secondary smallbtn">CANCEL</button>
+      `;
+      const textarea = form.querySelector("textarea");
+      const [payBtn, cancelBtn] = form.querySelectorAll("button");
+      cancelBtn.onclick = () => form.remove();
+      payBtn.onclick = async () => {
+        const prompt = textarea.value.trim();
+        if (!prompt) { window.logToUI("<span class='err'>Empty prompt</span>"); return; }
+        payBtn.disabled = true;
+        payBtn.textContent = "PROCESSING...";
+        try {
+          const result = await mktQuickAsk(offer._offerKey, prompt);
+          window.logToUI(`<span class='ok'>🎉 Ask submitted. Job <span class='mono'>${window.escapeHTML(result.jobId)}</span> · check MY ASKS tab.</span>`);
+          form.remove();
+        } catch (e) {
+          window.logToUI(`<span class='err'>❌ Ask failed: ${window.escapeHTML(e.message)}</span>`);
+          payBtn.disabled = false;
+          payBtn.textContent = "💳 PAY & SEND";
+        }
+      };
+      card.appendChild(form);
+    }
+
+    window.mktTogglePairMode = function() {
+      mktPairModeOn = !mktPairModeOn;
+      mktPairQueue.length = 0;
+      document.getElementById("mktPairBanner").classList.toggle("hidden", !mktPairModeOn);
+      document.getElementById("mktPairCount").textContent = "(0/2 selected)";
+      const btn = document.getElementById("mktPairBtn");
+      if (btn) btn.textContent = mktPairModeOn ? "🎭 EXIT COMPARE" : "🎭 COMPARE 2";
+      document.querySelectorAll(".mkt-ask-form, .mkt-pair-form").forEach(el => el.remove());
+      document.querySelectorAll(".mkt-selected-for-pair").forEach(el => el.classList.remove("mkt-selected-for-pair"));
+    };
+
+    function mktShowPairPromptForm() {
+      const list = document.getElementById("mktBrowseList");
+      const existing = list.querySelector(".mkt-pair-form");
+      if (existing) existing.remove();
+      const form = document.createElement("div");
+      form.className = "mkt-pair-form mkt-offer-card";
+      form.style.borderColor = "var(--warn)";
+      const [a, b] = mktPairQueue;
+      const totalA = (a.pricing.amountMicroAlgos + MKT_MBR_FLOAT)/1e6;
+      const totalB = (b.pricing.amountMicroAlgos + MKT_MBR_FLOAT)/1e6;
+      form.innerHTML = `
+        <div class="mkt-offer-title">🎭 Send same prompt to two agents</div>
+        <div class="hint" style="margin:4px 0;">
+          A: ${window.escapeHTML(a.title)} (${totalA.toFixed(6)} ALGO)<br>
+          B: ${window.escapeHTML(b.title)} (${totalB.toFixed(6)} ALGO)<br>
+          Total: <b style="color:var(--neon-green);">${(totalA+totalB).toFixed(6)} ALGO</b>
+        </div>
+        <textarea rows="3" placeholder="One prompt sent to both agents..."></textarea>
+        <button class="smallbtn">💳 PAY BOTH &amp; SEND</button>
+        <button class="secondary smallbtn">CANCEL</button>
+      `;
+      const textarea = form.querySelector("textarea");
+      const [payBtn, cancelBtn] = form.querySelectorAll("button");
+      cancelBtn.onclick = () => window.mktTogglePairMode();
+      payBtn.onclick = async () => {
+        const prompt = textarea.value.trim();
+        if (!prompt) { window.logToUI("<span class='err'>Empty prompt</span>"); return; }
+        payBtn.disabled = true;
+        payBtn.textContent = "PROCESSING...";
+        try {
+          window.logToUI("<hr>🎭 Compare mode: sending to agent A...");
+          await mktQuickAsk(a._offerKey, prompt);
+          window.logToUI("🎭 Compare mode: sending to agent B...");
+          await mktQuickAsk(b._offerKey, prompt);
+          window.logToUI(`<span class='ok'>🎉 Both asks submitted. Check MY ASKS tab for replies side-by-side.</span>`);
+          window.mktTogglePairMode();
+        } catch (e) {
+          window.logToUI(`<span class='err'>❌ Compare ask failed: ${window.escapeHTML(e.message)}</span>`);
+          payBtn.disabled = false;
+          payBtn.textContent = "💳 PAY BOTH & SEND";
+        }
+      };
+      list.insertBefore(form, list.firstChild);
+    }
+
+    window.mktRefreshMyOffers = async function() {
+      try {
+        if (!myAccount) throw new Error("Unlock marketplace first");
+        const list = document.getElementById("mktMyOffersList");
+        list.textContent = "Loading...";
+        const all = await mktLoadAllOffers();
+        const me  = accountAddress(myAccount);
+        const mine = all.filter(o => o.providerAddress === me);
+        list.innerHTML = "";
+        if (mine.length === 0) { list.textContent = "No offers yet. Publish one above."; return; }
+        for (const o of mine) list.appendChild(mktRenderOfferCard(o, { showToggle: true }));
+      } catch (e) {
+        document.getElementById("mktMyOffersList").innerHTML = `<span class='err'>${window.escapeHTML(e.message)}</span>`;
+      }
+    };
+
+    window.mktBrowseOffers = async function() {
+      try {
+        const list = document.getElementById("mktBrowseList");
+        list.innerHTML = '<div class="hint" style="grid-column:1/-1;">Loading offers from the on-chain index...</div>';
+        const tagFilter  = document.getElementById("mktFilterTag").value.trim().toLowerCase();
+        const modeFilter = document.getElementById("mktFilterMode").value;
+        const all = await mktLoadAllOffers();
+        const filtered = all.filter(o => {
+          if (!o.active) return false;
+          if (modeFilter && o.pricing && o.pricing.mode !== modeFilter) return false;
+          if (tagFilter && !(o.tags || []).some(t => String(t).toLowerCase().includes(tagFilter))) return false;
+          return true;
+        });
+        // Stats banner
+        const onlineCount = filtered.filter(o => {
+          const s = mktStatusFromHeartbeat(o._provider && o._provider.lastHeartbeat);
+          return s.cls === "online";
+        }).length;
+        const offersEl = document.getElementById("mktStatOffers");
+        const onlineEl = document.getElementById("mktStatOnline");
+        if (offersEl) offersEl.textContent = filtered.length;
+        if (onlineEl) onlineEl.textContent = onlineCount;
+
+        list.innerHTML = "";
+        if (filtered.length === 0) {
+          list.innerHTML = '<div class="hint" style="grid-column:1/-1; padding:20px; text-align:center;">No matching active offers yet. Be the first to publish one on the <b>BE A PROVIDER</b> tab.</div>';
+          return;
+        }
+        const me = myAccount ? accountAddress(myAccount) : null;
+        for (const o of filtered) {
+          // Show ASK if browsing publicly (no me) OR if it's not our own offer
+          list.appendChild(mktRenderOfferCard(o, { showAsk: !me || o.providerAddress !== me }));
+        }
+      } catch (e) {
+        document.getElementById("mktBrowseList").innerHTML = `<div class='err'>${window.escapeHTML(e.message)}</div>`;
+      }
+    };
+
+    function mktRenderJobCard(meta) {
+      const me = accountAddress(myAccount);
+      const role = meta.buyerAddress === me ? "buyer" : (meta.providerAddress === me ? "provider" : "?");
+      const card = document.createElement("div");
+      card.className = "mkt-job-card";
+      const statusCls = "mkt-status-" + (meta.status || "pending");
+      const counterparty = role === "buyer" ? meta.providerAddress : meta.buyerAddress;
+      const proofTxIdMaybe = meta.paymentTxId || meta.x402Proof;
+      const payUrl   = proofTxIdMaybe ? mktExplorerLink(proofTxIdMaybe) : null;
+      const floatUrl  = meta.mbrFloatTxId ? mktExplorerLink(meta.mbrFloatTxId) : null;
+      card.innerHTML = `
+        <div class="mkt-job-header">
+          <b style="color:var(--neon-green); flex:1;">${window.escapeHTML(meta.offerTitle || meta.jobId)}</b>
+          <span class="mono" style="font-size:10px; color:#888;">[${role}]</span>
+          <span class="mkt-status-badge ${statusCls}">${window.escapeHTML((meta.status || "pending").toUpperCase())}</span>
+        </div>
+        <div class="hint" style="margin-top:6px;">Job: <span class="mono">${window.escapeHTML(meta.jobId)}</span></div>
+        <div class="hint">${role === "buyer" ? "Provider" : "Buyer"}: <span class="mono">${window.escapeHTML((counterparty || "").slice(0,20))}...</span></div>
+        <div class="hint" style="margin-top:6px;">
+          💳 CoordiPay service: ${(meta.amountMicroAlgos/1e6).toFixed(6)} ALGO
+          ${payUrl ? ` · <a class="mkt-txlink" target="_blank" rel="noopener" href="${payUrl}">view on AlgoExplorer ↗</a>` : ''}
+        </div>
+        ${floatUrl ? `<div class="hint">📦 MBR float: ${((meta.mbrFloat||0)/1e6).toFixed(6)} ALGO · <a class="mkt-txlink" target="_blank" rel="noopener" href="${floatUrl}">view on AlgoExplorer ↗</a></div>` : ''}
+      `;
+      const tb = document.createElement("div");
+      tb.style.marginTop = "8px";
+      tb.style.display = "flex";
+      tb.style.gap = "6px";
+      tb.style.flexWrap = "wrap";
+
+      if (role === "buyer" && meta.status === "delivered") {
+        const readBtn = document.createElement("button");
+        readBtn.className = "smallbtn";
+        readBtn.textContent = "📖 READ REPLY";
+        readBtn.onclick = async () => {
+          try {
+            const env = await window.readEntity(mktDeliveryKey(meta.jobId));
+            const text = unpackFromSender(env, meta.providerAddress, myAccount);
+            const out = document.createElement("div");
+            out.className = "mkt-reply-bubble";
+            out.textContent = text;
+            card.appendChild(out);
+            readBtn.style.display = "none";
+            addHistory(`Provider ${mktShortAddr(meta.providerAddress, 10)}...`, `Reply [${meta.jobId}]`, text);
+            showTools();
+          } catch (e) { window.logToUI(`<span class='err'>${window.escapeHTML(e.message)}</span>`); }
+        };
+        tb.appendChild(readBtn);
+        const rateBtn = document.createElement("button");
+        rateBtn.className = "smallbtn";
+        rateBtn.textContent = "⭐ RATE";
+        rateBtn.onclick = async () => {
+          const stars = parseInt(prompt("Stars (1-5):"), 10);
+          if (!stars) return;
+          const review = prompt("Review text (max 180 chars, optional):") || "";
+          try {
+            await mktRateProvider(meta.jobId, meta.providerAddress, stars, review);
+            window.logToUI(`<span class='ok'>⭐ Rating saved (${stars}/5)</span>`);
+            await window.mktRefreshJobs();
+          } catch (e) { window.logToUI(`<span class='err'>${window.escapeHTML(e.message)}</span>`); }
+        };
+        tb.appendChild(rateBtn);
+      }
+
+      if (role === "provider" && meta.status === "pending") {
+        const note = document.createElement("span");
+        note.className = "hint";
+        note.style.alignSelf = "center";
+        note.textContent = "· Auto-respond loop will handle this. Toggle it on the BE A PROVIDER tab.";
+        tb.appendChild(note);
+      }
+
+      if (role === "buyer" && meta.status === "pending") {
+        const age = Math.round((Date.now() - (meta.paidAt || meta.createdAt || Date.now())) / 1000);
+        const note = document.createElement("div");
+        note.className = "hint";
+        note.style.cssText = "margin-top:6px; padding:6px 8px; background:rgba(255,191,0,0.05); border-left:3px solid var(--warn); color:#ccc;";
+        if (age > 60) {
+          note.innerHTML = `⏳ Waiting ${age}s · The provider's auto-respond loop must be running with an LLM loaded to answer. If they're offline, your funds have already been transferred (no escrow) but no reply will arrive. <br><br>Try the 🗑 CLEANUP & RECLAIM MBR button to recover your box-MBR (won't refund the Service fee).`;
+        } else {
+          note.innerHTML = `⏳ Waiting for provider (${age}s)... auto-respond loop polls inbox every 12 seconds.`;
+        }
+        tb.appendChild(note);
+      }
+
+      // Cleanup & MBR refund — visible on terminal states OR pending jobs older than 5 min
+      const ageSec = Math.round((Date.now() - (meta.paidAt || meta.createdAt || Date.now())) / 1000);
+      const canCleanup = (meta.status === "rated" || meta.status === "delivered") ||
+                         (meta.status === "pending" && ageSec > 300 && role === "buyer");
+      if (canCleanup && (role === "buyer" || role === "provider")) {
+        const cleanBtn = document.createElement("button");
+        cleanBtn.className = "secondary smallbtn";
+        cleanBtn.textContent = "🗑 CLEANUP & RECLAIM MBR";
+        cleanBtn.title = "Delete this job's boxes (you created) and reclaim the MBR back to your account";
+        cleanBtn.onclick = async () => {
+          if (!confirm("Delete the boxes you created for this job and reclaim the MBR? This is irreversible.")) return;
+          cleanBtn.disabled = true;
+          cleanBtn.textContent = "DELETING...";
+          try {
+            await mktCleanupJob(meta.jobId);
+            await window.mktRefreshJobs();
+          } catch (e) {
+            window.logToUI(`<span class='err'>❌ Cleanup failed: ${window.escapeHTML(e.message)}</span>`);
+            cleanBtn.disabled = false;
+            cleanBtn.textContent = "🗑 CLEANUP & RECLAIM MBR";
+          }
+        };
+        tb.appendChild(cleanBtn);
+      }
+
+      card.appendChild(tb);
+      return card;
+    }
+
+    // ════ Per-job cleanup: deletes the boxes you created and refunds your MBR ════
+    async function mktCleanupJob(jobId) {
+      if (!myAccount) throw new Error("Unlock first");
+      const me = accountAddress(myAccount);
+      let meta;
+      try { meta = await mktReadJSON(mktJobMetaKey(jobId)); }
+      catch (e) { meta = null; }
+      const isBuyer    = meta && meta.buyerAddress    === me;
+      const isProvider = meta && meta.providerAddress === me;
+
+      const toDelete = [];
+      if (isBuyer) {
+        // Buyer created: prompt, meta, and all receipts
+        toDelete.push(mktPromptKey(jobId));
+        toDelete.push(mktJobMetaKey(jobId));
+        for (const k of Array.from(trackedEntityIds)) {
+          if (k.startsWith(`rcpt:${jobId}:`)) toDelete.push(k);
+        }
+      }
+      if (isProvider && meta && (meta.status === "delivered" || meta.status === "rated")) {
+        // Provider created: the delivery box
+        toDelete.push(mktDeliveryKey(jobId));
+      }
+
+      window.logToUI(`<hr>🗑 Cleanup job <span class='mono'>${window.escapeHTML(jobId)}</span> as ${isBuyer ? "buyer" : "provider"} — deleting ${toDelete.length} box(es)...`);
+      let refunded = 0;
+      for (const k of toDelete) {
+        try {
+          await window.deleteEntity(k);
+          trackedEntityIds.delete(k);
+          refunded++;
+          window.logToUI(`<span class='ok'>&nbsp;&nbsp;✅ Deleted ${window.escapeHTML(k)} · MBR refunded</span>`);
+        } catch (e) {
+          window.logToUI(`<span class='warn'>&nbsp;&nbsp;⚠️ Could not delete ${window.escapeHTML(k)}: ${window.escapeHTML(e.message)}</span>`);
+        }
+      }
+      mktKnownJobIds.delete(jobId);
+      window.logToUI(`<span class='ok'>🗑 Cleanup done · ${refunded} box(es) refunded · ~${(refunded * 0.5).toFixed(2)} ALGO returned to your account</span>`);
+    }
+
+    window.mktRefreshJobs = async function() {
+      try {
+        if (!myAccount) return;
+        const list = document.getElementById("mktJobsList");
+        list.textContent = "Loading...";
+        const me = accountAddress(myAccount);
+        const jobs = [];
+        // From locally tracked
+        for (const jobId of mktKnownJobIds) {
+          try { jobs.push(await mktReadJSON(mktJobMetaKey(jobId))); } catch (e) {}
+        }
+        // From trackedEntityIds (catches jobs we created and ones in our inbox)
+        for (const k of trackedEntityIds) {
+          if (k.startsWith("job:") && k.endsWith(":meta")) {
+            try {
+              const m = await mktReadJSON(k);
+              if (!jobs.find(j => j.jobId === m.jobId)) jobs.push(m);
+            } catch (e) {}
+          }
+        }
+        // From own inbox (provider sees incoming asks even if not in trackedEntityIds)
+        try {
+          const inbox = await mktReadJSON(mktInboxKey(me));
+          for (const item of (inbox.pending || []).concat((inbox.processed || []).map(j => ({jobId: j})))) {
+            try {
+              if (!jobs.find(j => j.jobId === item.jobId)) {
+                const m = await mktReadJSON(mktJobMetaKey(item.jobId));
+                jobs.push(m);
+              }
+            } catch (e) {}
+          }
+        } catch (e) {}
+
+        list.innerHTML = "";
+        if (jobs.length === 0) {
+          list.innerHTML = '<span class="hint">No asks yet. Browse offers on the ASK AGENTS tab.</span>';
+          return;
+        }
+        // Derive status from on-chain entity existence (the cross-actor flow can't update
+        // status fields, so meta.status is always "pending" from creation onwards)
+        for (const j of jobs) {
+          let hasDelivery = false, hasRating = false;
+          try {
+            const d = await window.readEntity(mktDeliveryKey(j.jobId));
+            if (d != null) hasDelivery = true;
+          } catch (e) {}
+          try {
+            const r = await window.readEntity(mktRatingKey(j.providerAddress, j.jobId));
+            if (r != null) hasRating = true;
+          } catch (e) {}
+          if      (hasRating)   j.status = "rated";
+          else if (hasDelivery) j.status = "delivered";
+          // else keep j.status = "pending" (as set at creation)
+        }
+        // My jobs first (as buyer), then provider-side
+        jobs.sort((a,b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        for (const j of jobs) list.appendChild(mktRenderJobCard(j));
+      } catch (e) {
+        document.getElementById("mktJobsList").innerHTML = `<span class='err'>${window.escapeHTML(e.message)}</span>`;
+      }
+    };
+    // ═══════════════════════════════════════════════════════════════════════════
+    // end MARKETPLACE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ════ Auto-browse offers on page load (no auth needed) ════
+    document.addEventListener("DOMContentLoaded", () => {
+      let attempts = 0;
+      const tryBrowse = () => {
+        attempts++;
+        if (typeof window.createEntity === "function" && typeof window.mktBrowseOffers === "function") {
+          window.mktBrowseOffers().catch(() => {});
+        } else if (attempts < 40) {
+          setTimeout(tryBrowse, 500);
+        }
+      };
+      setTimeout(tryBrowse, 800);
+    });
+
+    function validateMnemonic(mn) {
+      if (!mn || mn.trim().split(/\s+/).length !== 25) throw new Error("Please enter a valid 25-word TestNet mnemonic");
+    }
+
+    function validateAddress(addr, label) {
+      if (!addr || !algosdk.isValidAddress(addr)) throw new Error(`Please enter a valid ${label} address`);
+    }
+
+    function getTurn(state) { return Number(state?.t ?? state?.current_turn ?? 0); }
+    function getType(state) { return String(state?.type || state?.state || ""); }
+
+    function setOutput(id, text) {
+      const el = document.getElementById(id);
+      if (el) el.value = text || "";
+    }
+
+    function accountAddress(account) {
+      if (!account) throw new Error("Account not available");
+      if (typeof account.addr === "string" && algosdk.isValidAddress(account.addr)) return account.addr;
+      if (account.addr && typeof account.addr.toString === "function") {
+        const s = account.addr.toString();
+        if (algosdk.isValidAddress(s)) return s;
+      }
+      if (account.sk && account.sk.length >= 64) return algosdk.encodeAddress(account.sk.slice(32, 64));
+      throw new Error("Could not derive account address");
+    }
+
+    window.copyCoderAddress = async function() {
+      const addr = document.getElementById("coderAddressText")?.textContent || "";
+      if (!addr) return window.logToUI("<span class='err'>❌ No coder address available yet</span>");
+      try {
+        await navigator.clipboard.writeText(addr);
+        window.logToUI("<span class='ok'>✅ Coder address copied</span>");
+      } catch {
+        window.logToUI("<span class='warn'>⚠️ Copy failed. Please copy the address manually.</span>");
+      }
+    };
+
+    function includesErrorFree(text) {
+      if (!text) return false;
+      if (typeof ACTIVE_MODE !== "undefined" && ACTIVE_MODE && ACTIVE_MODE.approvalRegex) {
+        return ACTIVE_MODE.approvalRegex.test(text);
+      }
+      // Fallback: tolerant default for code-review, accepts hyphen/space variants
+      return /STATUS\s*[:\-]\s*(ERROR[_\-\s]?FREE|APPROVED|LGTM)\b/i.test(text);
+    }
+
+    // === Algorand single-tx ApplicationArgs cap is 2048 bytes total. ===
+    // After NaCl encryption (40 B overhead) + base64 (~×4/3) + JSON envelope (~85 B) +
+    // method selector (4 B) + entity_id ARC-4 wrap (~30 B) + data ARC-4 length prefix (2 B),
+    // the safe plaintext ceiling is ~1400 chars. We clip at 1300 for safety margin.
+    // Without this, a single transaction exceeds the protocol limit and algod returns 400
+    // "tx.ApplicationArgs total length is too long".
+    function clipForOnChain(plaintext, label) {
+      const MAX_ON_CHAIN_CHARS = 1300;
+      const text = String(plaintext || "");
+      if (text.length <= MAX_ON_CHAIN_CHARS) return text;
+      window.logToUI(`<span class='warn'>⚠️ ${window.escapeHTML(label || "Artifact")} clipped from ${text.length} → ${MAX_ON_CHAIN_CHARS} chars to fit Algorand single-tx limit (ApplicationArgs ≤ 2048 B). Local UI shows full output; only the clipped version is transmitted on-chain.</span>`);
+      return text.slice(0, MAX_ON_CHAIN_CHARS);
+    }
+
+    window.enc = function(d, toAddr, account) {
+      const tp = algosdk.decodeAddress(toAddr).publicKey;
+      const secretSeed = account.sk.slice(0, 32);
+      const tc = ed2curve.convertPublicKey(tp);
+      const mc = ed2curve.convertSecretKey(secretSeed);
+      if (!tc || !mc) throw new Error("Encryption key conversion failed");
+      const n = nacl.randomBytes(nacl.box.nonceLength);
+      const e = nacl.box(nacl.util.decodeUTF8(d), n, tc, mc);
+      const c = new Uint8Array(n.length + e.length);
+      c.set(n); c.set(e, n.length);
+      return nacl.util.encodeBase64(c);
+    };
+
+    window.dec = function(e64, fromAddr, account) {
+      const c = nacl.util.decodeBase64(e64);
+      const n = c.slice(0, nacl.box.nonceLength);
+      const e = c.slice(nacl.box.nonceLength);
+      const sc = ed2curve.convertPublicKey(algosdk.decodeAddress(fromAddr).publicKey);
+      const mc = ed2curve.convertSecretKey(account.sk.slice(0, 32));
+      if (!sc || !mc) throw new Error("Decryption key conversion failed");
+      const d = nacl.box.open(e, n, sc, mc);
+      return d ? nacl.util.encodeUTF8(d) : null;
+    };
+
+    function packForRecipient(plainText, toAddr, account) {
+      // Strict NaCl Box encryption. Do not silently store plain text.
+      return JSON.stringify({
+        v: 1,
+        encrypted: true,
+        alg: "nacl.box.ed25519-to-curve25519",
+        data: window.enc(plainText, toAddr, account)
+      });
+    }
+
+    function unpackFromSender(storedText, fromAddr, account) {
+      const obj = JSON.parse(storedText || "{}");
+      if (!obj || obj.encrypted !== true || !obj.data) {
+        throw new Error("Stored payload is not a valid encrypted NaCl envelope");
+      }
+      const plain = window.dec(obj.data, fromAddr, account);
+      if (plain === null) throw new Error("NaCl decryption failed. Check that coder/reviewer addresses are correct.");
+      return plain;
+    }
+
+    window.stopLoops = function() {
+      isRunning = false;
+      window.logToUI("⏹️ Loop stopped by user.");
+    };
+
+    window.startAsCoder = async function() {
+        try {
+            requireDeps();
+            const mn = document.getElementById("coderMnemonic").value.trim();
+            recipientAddress = document.getElementById("reviewerAddress").value.trim();
+            const task = document.getElementById("codeTask").value.trim();
+
+            validateMnemonic(mn);
+            validateAddress(recipientAddress, "reviewer");
+            if (!task) throw new Error("Please enter a code task");
+
+            localStorage.setItem("mnemonic", mn);
+            localStorage.setItem("codeTask", task);
+            addHistory("CODER", "USER PROMPT / TASK", task);
+            myAccount = algosdk.mnemonicToSecretKey(mn);
+
+            const initialState = JSON.stringify({ t: 0, type: "SESSION_STARTED", createdAt: Date.now() });
+            processId = await window.createProcess(`cr_${Date.now()}`, recipientAddress, initialState);
+            window.lastProcessId = processId;
+
+            const taskOnChain = clipForOnChain(task, `${ACTIVE_MODE.roleA_label} task`);
+            const taskEnvelope = packForRecipient(taskOnChain, recipientAddress, myAccount);
+            await window.createEntity(`${processId}_task`, taskEnvelope);
+            trackedEntityIds.add(`${processId}_task`);
+
+            const coderAddr = accountAddress(myAccount);
+            const addrBox = document.getElementById('coderAddressBox');
+            const addrText = document.getElementById('coderAddressText');
+            if (addrBox && addrText) { addrText.textContent = coderAddr; addrBox.classList.remove('hidden'); }
+            window.logToUI(`✅ Process created: <span class='mono'>${window.escapeHTML(processId)}</span>`);
+            window.logToUI(`📋 Reviewer can auto-discover using coder address: <span class='mono'>${window.escapeHTML(coderAddr)}</span>`);
+            isRunning = true;
+            isApproved = false;
+            lastHandledTurn = -1;
+            window.runCoderLoop();
+        } catch (e) {
+            window.logToUI(`<span class='err'>❌ ${window.escapeHTML(e.message)}</span>`);
+            console.error(e);
+        }
+    };
+
+    window.runCoderLoop = async function() {
+        while (isRunning && !isApproved) {
+            try {
+                const state = await window.readProcess(processId);
+                if (!state) { await window.sleep(10000); continue; }
+                const turn = getTurn(state);
+                const type = getType(state);
+
+                if (turn === lastHandledTurn) { await window.sleep(10000); continue; }
+
+                if (turn === 0 || type === "SESSION_STARTED" || type === "REVIEW_READY") {
+                    lastHandledTurn = turn;
+
+                    if (turn >= ACTIVE_MODE.maxIterations) {
+                      window.logToUI(`<span class='warn'>⛔ Reached max iterations (${ACTIVE_MODE.maxIterations}) for mode "${window.escapeHTML(ACTIVE_MODE.name)}". Halting loop without convergence. Use STOP LOOP and DOWNLOAD HISTORY to inspect.</span>`);
+                      isRunning = false;
+                      break;
+                    }
+
+                    let reviewText = "";
+
+                    if (type === "REVIEW_READY" && state.reviewEntity) {
+                      const storedReview = await window.readEntity(state.reviewEntity);
+                      reviewText = unpackFromSender(storedReview, recipientAddress, myAccount);
+                      setOutput("coderOutput", reviewText);
+                      addHistory("REVIEWER", `REVIEW TURN ${turn}`, reviewText);
+                      trackedEntityIds.add(state.reviewEntity);
+                      window.logToUI(`📥 Review received from entity: <span class='mono'>${window.escapeHTML(state.reviewEntity)}</span>`);
+
+                      if (includesErrorFree(reviewText)) {
+                        finalApprovedCode = lastGeneratedCode || window.lastGeneratedCode || "";
+                        window.finalApprovedCode = finalApprovedCode;
+                        isApproved = true;
+                        isRunning = false;
+                        window.logToUI("✅ Reviewer marked artifact ERROR_FREE. Coordination complete.");
+                        if (finalApprovedCode) window.logToUI("💾 Final code is ready. Use DOWNLOAD FINAL CODE in Session Tools.");
+                        break;
+                      }
+                    }
+
+                    window.logToUI("<hr>🤖 Local AI coding...");
+                    const codeFull = await window.callGrokAPI(reviewText);
+                    setOutput("coderOutput", codeFull);
+                    const code = clipForOnChain(codeFull, `${ACTIVE_MODE.roleA_label} output`);
+                    lastGeneratedCode = code;
+                    window.lastGeneratedCode = code;
+                    addHistory("CODER", `CODE TURN ${turn + 1}`, code);
+
+                    const nextTurn = turn + 1;
+                    const codeEntityId = `${processId}_code_${nextTurn}`;
+                    const codeEnvelope = packForRecipient(code, recipientAddress, myAccount);
+                    await window.createEntity(codeEntityId, codeEnvelope);
+                    trackedEntityIds.add(codeEntityId);
+
+                    await window.advanceProcess(processId, nextTurn, JSON.stringify({
+                      t: nextTurn,
+                      type: "CODE_READY",
+                      codeEntity: codeEntityId,
+                      updatedAt: Date.now()
+                    }));
+                    window.logToUI(`✅ Code ready in entity: <span class='mono'>${window.escapeHTML(codeEntityId)}</span>`);
+                }
+            } catch (e) {
+                window.logToUI(`<span class='err'>❌ Coder loop error: ${window.escapeHTML(e.message)}</span>`);
+                console.error(e);
+                isRunning = false;
+            }
+            await window.sleep(10000);
+        }
+    };
+
+    window.startAsReviewer = async function() {
+        try {
+            requireDeps();
+            const mn = document.getElementById("reviewerMnemonic").value.trim();
+            const coderAddress = document.getElementById("coderAddress").value.trim();
+
+            validateMnemonic(mn);
+            validateAddress(coderAddress, "coder");
+
+            localStorage.setItem("mnemonic", mn);
+            myAccount = algosdk.mnemonicToSecretKey(mn);
+            recipientAddress = coderAddress;
+
+            const reviewerAddress = accountAddress(myAccount);
+            if (reviewerAddress === coderAddress) {
+              throw new Error("Coder and reviewer addresses are the same. Paste the coder's address, not your own.");
+            }
+
+            window.logToUI(`🔍 Auto-discovering newest process from coder <span class='mono'>${window.escapeHTML(coderAddress)}</span> to reviewer <span class='mono'>${window.escapeHTML(reviewerAddress)}</span>...`);
+            processId = await window.discoverProcess(coderAddress, reviewerAddress);
+            if (!processId) throw new Error("No active process found. Start coder first, then paste the coder's address here.");
+            window.lastProcessId = processId;
+
+            isRunning = true;
+            isApproved = false;
+            lastHandledTurn = -1;
+
+            window.logToUI(`✅ Reviewer joined discovered process: <span class='mono'>${window.escapeHTML(processId)}</span>`);
+            window.runReviewerLoop();
+        } catch (e) {
+            window.logToUI(`<span class='err'>❌ ${window.escapeHTML(e.message)}</span>`);
+            console.error(e);
+        }
+    };
+
+    window.discoverProcess = async function(coderAddr, reviewerAddr) {
+      const appId = (typeof APP_ID !== "undefined") ? APP_ID : 750081112;
+      const maxAttempts = 3;
+      const searchRounds = 2000;
+      const matches = [];
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          if (attempt > 1) {
+            window.logToUI(`⏳ Auto-discovery retry ${attempt}/${maxAttempts}...`);
+            await window.sleep(3000);
+          }
+
+          const status = await algodClient.status().do();
+          const currentRound = Number(status["last-round"] || status.lastRound || 0);
+          const minRound = Math.max(0, currentRound - searchRounds);
+
+          const response = await indexerClient
+            .searchForTransactions()
+            .applicationID(appId)
+            .minRound(minRound)
+            .limit(100)
+            .do();
+
+          const txns = response.transactions || [];
+          window.logToUI(`📊 Auto-discovery scanned ${txns.length} recent app transactions`);
+
+          for (const txn of txns) {
+            const appCall = txn["application-transaction"];
+            const args = appCall?.["application-args"];
+            if (!args || args.length < 3) continue;
+            if (txn.sender !== coderAddr) continue;
+
+            try {
+              const processIdBytes = Uint8Array.from(atob(args[1]), c => c.charCodeAt(0));
+              const otherPartyBytes = Uint8Array.from(atob(args[2]), c => c.charCodeAt(0));
+              const candidateProcessId = new TextDecoder().decode(processIdBytes.slice(2));
+              const otherPartyAddr = algosdk.encodeAddress(otherPartyBytes);
+
+              if (!candidateProcessId.startsWith("cr_")) continue;
+              if (otherPartyAddr !== reviewerAddr) continue;
+
+              const timestampMatch = candidateProcessId.match(/^cr_(\d+)$/);
+              const timestamp = timestampMatch ? Number(timestampMatch[1]) : 0;
+              matches.push({ processId: candidateProcessId, timestamp, round: Number(txn["confirmed-round"] || 0) });
+            } catch (_) {
+              // Skip non-matching ABI calls.
+            }
+          }
+
+          if (matches.length > 0) {
+            matches.sort((a, b) => (b.timestamp || b.round) - (a.timestamp || a.round));
+            const newest = matches[0];
+            window.logToUI(`✅ Auto-discovered newest process: <span class='mono'>${window.escapeHTML(newest.processId)}</span>`);
+            return newest.processId;
+          }
+        } catch (error) {
+          window.logToUI(`<span class='warn'>⚠️ Auto-discovery attempt failed: ${window.escapeHTML(error.message)}</span>`);
+        }
+      }
+
+      return null;
+    };
+
+    window.runReviewerLoop = async function() {
+        while (isRunning && !isApproved) {
+            try {
+                const state = await window.readProcess(processId);
+                if (!state) { await window.sleep(10000); continue; }
+                const turn = getTurn(state);
+                const type = getType(state);
+
+                if (turn === lastHandledTurn) { await window.sleep(10000); continue; }
+
+                if (type === "CODE_READY" && state.codeEntity) {
+                    lastHandledTurn = turn;
+
+                    if (turn >= ACTIVE_MODE.maxIterations) {
+                      window.logToUI(`<span class='warn'>⛔ Reached max iterations (${ACTIVE_MODE.maxIterations}) for mode "${window.escapeHTML(ACTIVE_MODE.name)}". Halting loop without convergence.</span>`);
+                      isRunning = false;
+                      break;
+                    }
+
+                    window.logToUI(`📥 Reading code entity: <span class='mono'>${window.escapeHTML(state.codeEntity)}</span>`);
+                    const storedCode = await window.readEntity(state.codeEntity);
+                    const code = unpackFromSender(storedCode, recipientAddress, myAccount);
+                    setOutput("reviewerOutput", code);
+                    trackedEntityIds.add(state.codeEntity);
+                    addHistory("CODER", `CODE TURN ${turn}`, code);
+
+                    window.logToUI("<hr>🔍 Local AI reviewing...");
+                    setOutput("reviewerOutput", "Local AI reviewer is thinking...\n\nThis patched version logs progress every 15 seconds and times out safely after 3 minutes.");
+                    const reviewFull = await window.callOpenAIAPI(code);
+                    setOutput("reviewerOutput", reviewFull);
+                    const review = clipForOnChain(reviewFull, `${ACTIVE_MODE.roleB_label} output`);
+                    addHistory("REVIEWER", `REVIEW TURN ${turn + 1}`, review);
+
+                    const nextTurn = turn + 1;
+                    const reviewEntityId = `${processId}_review_${nextTurn}`;
+                    const reviewEnvelope = packForRecipient(review, recipientAddress, myAccount);
+                    await window.createEntity(reviewEntityId, reviewEnvelope);
+                    trackedEntityIds.add(reviewEntityId);
+
+                    await window.advanceProcess(processId, nextTurn, JSON.stringify({
+                      t: nextTurn,
+                      type: "REVIEW_READY",
+                      reviewEntity: reviewEntityId,
+                      approved: includesErrorFree(review),
+                      updatedAt: Date.now()
+                    }));
+
+                    window.logToUI(`✅ Review ready in entity: <span class='mono'>${window.escapeHTML(reviewEntityId)}</span>`);
+                    if (includesErrorFree(review)) {
+                      finalApprovedCode = code;
+                      window.finalApprovedCode = code;
+                      isApproved = true;
+                      isRunning = false;
+                      window.logToUI("✅ Review ended with STATUS: ERROR_FREE. Coordination complete.");
+                      window.logToUI("💾 Final code is ready. Use DOWNLOAD FINAL CODE in Session Tools.");
+                    }
+                }
+            } catch (e) {
+                window.logToUI(`<span class='err'>❌ Reviewer loop error: ${window.escapeHTML(e.message)}</span>`);
+                console.error(e);
+                isRunning = false;
+            }
+            await window.sleep(10000);
+        }
+    };
+  </script>
+</body>
+</html>
