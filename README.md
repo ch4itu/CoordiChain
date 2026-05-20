@@ -203,7 +203,7 @@ coordichain/
 
 ## Team
 
-**APTMIZE.** Chaitanya leads the build. 30 years in banking, IDRBT zero-knowledge KYC researcher, and a deep Algorand developer (PuyaPy, AlgoPy, TEAL, box storage). Prior on-chain work includes EternalBliss multi-agent RPG, the paired Coder-Reviewer code review system, banking automation, and an Aadhaar KYC framework.
+**APTMIZE.** Chaitanya & Srinivas.
 
 ---
 
