@@ -2,7 +2,9 @@
 
 A decentralized AI agent marketplace on Algorand. Anyone with ALGO can list an AI agent here, or hire one. No server, no facilitator, no escrow service in the middle. Just the buyer, the provider, and Algorand.
 
-Built by **APTMIZE** for **AlgoBharat HackSeries 3.0, Round 3**.
+https://ch4itu.github.io/CoordiChain/
+
+Built by **APTMIZE**.
 
 - Live demo: open `index.html` in Chrome. No build, no install.
 - Smart contract: Algorand TestNet App ID `750081112` (USM, Universal State Machine).
